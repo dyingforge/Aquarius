@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Aquarius local service (macOS launchd).
+
+  launchd keeps the process alive and restarts it after a crash; the daily
+  03:00 (Asia/Shanghai) schedule and missed-window catch-up live in the
+  application, not here. That is deliberate: a launchd StartCalendarInterval
+  cannot run a job while the machine is asleep, whereas the service can detect
+  the missed window on its next start.
+
+  Install with: scripts/install-launchd.sh
+  @AQUARIUS_NODE@ and @AQUARIUS_ENTRY@ are replaced by the installer.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.aquarius.server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@AQUARIUS_NODE@</string>
+    <string>--disable-warning=ExperimentalWarning</string>
+    <string>@AQUARIUS_ENTRY@</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@AQUARIUS_APP_ROOT@</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AQUARIUS_HOME</key>
+    <string>@AQUARIUS_HOME@</string>
+    <key>AQUARIUS_LOG_LEVEL</key>
+    <string>info</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>@AQUARIUS_HOME@/logs/aquarius.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>@AQUARIUS_HOME@/logs/aquarius.err.log</string>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+</dict>
+</plist>

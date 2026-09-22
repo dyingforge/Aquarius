@@ -1,0 +1,22 @@
+{
+  "name": "@aquarius/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Aquarius CLI — a thin client over the local HTTP API.",
+  "bin": {
+    "aquarius": "./src/main.ts"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "node --test --test-concurrency=1 \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@aquarius/core": "workspace:*",
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2",
+    "typescript": "5.9.3"
+  }
+}

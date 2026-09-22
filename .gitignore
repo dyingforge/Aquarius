@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.log
+
+# Local runtime state must never be committed (SQLite runtime state, tokens, logs).
+.aquarius/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.aquarius-tmp/
+
+# macOS
+.DS_Store
