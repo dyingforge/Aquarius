@@ -65,6 +65,7 @@ export async function createEnvironment(options: CreateEnvironmentOptions = {}):
     host: '127.0.0.1',
     port: 0,
     model: 'fake-deterministic-v1',
+    modelBaseUrl: null,
     agentRuntime: 'fake',
     openaiApiKey: null,
     tracing: false,

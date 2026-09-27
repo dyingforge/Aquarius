@@ -2,6 +2,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 *.log
+.env
+.env.*
+!.env.example
 
 # Local runtime state must never be committed (SQLite runtime state, tokens, logs).
 .aquarius/

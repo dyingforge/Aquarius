@@ -119,6 +119,9 @@ test('a non-empty directory that is not a Git repository is never clobbered', as
 test('the application repository and the memory repository are required to be separate', async () => {
   const { loadConfig, APP_REPO_ROOT } = await import('../config.ts');
   const { join } = await import('node:path');
+  const { readFile } = await import('node:fs/promises');
+  const manifest = JSON.parse(await readFile(join(APP_REPO_ROOT, 'package.json'), 'utf8')) as { name: string };
+  assert.equal(manifest.name, 'aquarius', 'the repository root must resolve to this application');
   const loaded = await loadConfig({
     env: {
       AQUARIUS_HOME: join(APP_REPO_ROOT, '.aquarius-test-home'),
@@ -152,6 +155,62 @@ test('a missing API key blocks startup unless the runtime is the deterministic d
     } as unknown as NodeJS.ProcessEnv,
   });
   assert.equal(withFakeRuntime.issues.length, 0);
+});
+
+test('model endpoint and key come from explicit environment settings without exposing the key', async () => {
+  const { loadConfig, sanitizeConfigForOutput } = await import('../config.ts');
+  const env = await createEnvironment();
+  try {
+    const loaded = await loadConfig({
+      home: env.home,
+      env: {
+        AQUARIUS_HOME: env.home,
+        AQUARIUS_AGENT_RUNTIME: 'openai',
+        AQUARIUS_MODEL: 'deepseek-flash',
+        AQUARIUS_MODEL_BASE_URL: 'https://api.deepseek.com',
+        AQUARIUS_MODEL_API_KEY: 'provider-test-key',
+        OPENAI_BASE_URL: 'https://api.openai.com/v1',
+        OPENAI_API_KEY: 'legacy-test-key',
+        AQUARIUS_API_TOKEN: 'local-test-token',
+      } as NodeJS.ProcessEnv,
+    });
+    assert.equal(loaded.issues.length, 0);
+    assert.equal(loaded.config.model, 'deepseek-flash');
+    assert.equal(loaded.config.modelBaseUrl, 'https://api.deepseek.com');
+    assert.equal(loaded.config.openaiApiKey, 'provider-test-key');
+    const safe = sanitizeConfigForOutput(loaded.config);
+    assert.equal(safe['openaiApiKey'], undefined);
+    assert.equal(JSON.stringify(safe).includes('provider-test-key'), false);
+
+    const blankKey = await loadConfig({
+      home: env.home,
+      env: {
+        AQUARIUS_HOME: env.home,
+        AQUARIUS_AGENT_RUNTIME: 'openai',
+        AQUARIUS_MODEL: 'deepseek-flash',
+        AQUARIUS_MODEL_BASE_URL: 'https://api.deepseek.com',
+        AQUARIUS_MODEL_API_KEY: '',
+        OPENAI_API_KEY: 'legacy-test-key',
+        AQUARIUS_API_TOKEN: 'local-test-token',
+      } as NodeJS.ProcessEnv,
+    });
+    assert.equal(blankKey.config.openaiApiKey, null);
+    assert.ok(blankKey.issues.some((issue) => issue.field === 'openaiApiKey'));
+
+    const invalid = await loadConfig({
+      home: env.home,
+      env: {
+        AQUARIUS_HOME: env.home,
+        AQUARIUS_AGENT_RUNTIME: 'openai',
+        AQUARIUS_MODEL_API_KEY: 'provider-test-key',
+        AQUARIUS_MODEL_BASE_URL: 'http://remote.example/api',
+        AQUARIUS_API_TOKEN: 'local-test-token',
+      } as NodeJS.ProcessEnv,
+    });
+    assert.ok(invalid.issues.some((issue) => issue.field === 'modelBaseUrl'));
+  } finally {
+    await env.cleanup();
+  }
 });
 
 test('non-loopback bind addresses are rejected by configuration', async () => {

@@ -38,6 +38,9 @@ const log = createLogger('agents:openai');
 /** Minimal structural view of the Agents SDK surface Aquarius uses. */
 interface AgentsSdk {
   Agent: new (config: Record<string, unknown>) => unknown;
+  OpenAIProvider: new (config: { apiKey: string; baseURL?: string; useResponses: boolean }) => {
+    getModel: (name: string) => Promise<unknown>;
+  };
   run: (
     agent: unknown,
     input: string,
@@ -71,6 +74,7 @@ export class OpenAIAgentRuntime implements AgentRuntime {
   readonly mode = 'openai' as const;
   readonly model: string;
   #sdk: AgentsSdk | null = null;
+  #modelProvider: { getModel: (name: string) => Promise<unknown> } | null = null;
   #config: AquariusConfig;
   #readMemoryFile: (path: string) => Promise<string | null>;
   /** Hard cap on tool calls per run, enforced by counting invocations ourselves. */
@@ -84,14 +88,13 @@ export class OpenAIAgentRuntime implements AgentRuntime {
     if (!options.config.openaiApiKey) {
       throw new AquariusError(
         'config_missing',
-        'The OpenAI agent runtime requires OPENAI_API_KEY.',
+        'The model runtime requires an API key.',
         {
           actionable:
-            'Export OPENAI_API_KEY in the service environment, or start a dry-run instance with AQUARIUS_AGENT_RUNTIME=fake.',
+            'Set AQUARIUS_MODEL_API_KEY (or OPENAI_API_KEY), or start a dry-run instance with AQUARIUS_AGENT_RUNTIME=fake.',
         },
       );
     }
-    process.env['OPENAI_API_KEY'] = options.config.openaiApiKey;
   }
 
   describe(): AgentRuntimeDescription {
@@ -114,6 +117,11 @@ export class OpenAIAgentRuntime implements AgentRuntime {
     try {
       const module = (await import('@openai/agents')) as unknown as AgentsSdk;
       module.setTracingDisabled(!this.#config.tracing);
+      this.#modelProvider = new module.OpenAIProvider({
+        apiKey: this.#config.openaiApiKey!,
+        ...(this.#config.modelBaseUrl ? { baseURL: this.#config.modelBaseUrl } : {}),
+        useResponses: true,
+      });
       this.#sdk = module;
       return module;
     } catch (error) {
@@ -150,7 +158,7 @@ export class OpenAIAgentRuntime implements AgentRuntime {
     const agent = new sdk.Agent({
       name: options.name,
       instructions: options.instructions,
-      model: this.model,
+      model: await this.#modelProvider!.getModel(this.model),
       modelSettings: { maxTokens: budget.maxOutputTokens } as unknown as Record<string, unknown>,
       outputType: options.outputSchema,
       tools: options.tools ?? [],

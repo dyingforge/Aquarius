@@ -229,7 +229,7 @@ trailer 是启动对账的唯一依据：Git 提交成功但 SQLite 未更新时
 | --- | --- | --- |
 | 新的会话来源（Claude Code 等） | 实现 `SessionSourceAdapter`，注册进 `AdapterRegistry` | 流水线、门禁、检索、存储 |
 | 新的记忆类型 | `memory/schema.ts` 的 enum + `paths.ts` 的布局 + 门禁规则 | 存储与提交机制 |
-| 换模型或加预算 | 配置项（`AQUARIUS_MODEL`、`budgets`） | Agent 契约 |
+| 换模型、端点或预算 | 配置项（`AQUARIUS_MODEL`、`AQUARIUS_MODEL_BASE_URL`、`budgets`） | Agent 契约 |
 | 调整晋升/发布规则 | `gates/promotion.ts` + 对应测试 | Agent 提示词 |
 | 换检索实现 | `ProjectionStore` + `RetrievalService` | 记忆契约与 Git 层 |
 | 只读 Web UI | 新增 `packages/web`，复用 HTTP API | 领域层（不要复制业务逻辑） |

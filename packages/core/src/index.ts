@@ -8,6 +8,7 @@
 export {
   SERVICE_VERSION,
   loadConfig,
+  loadLocalEnvFile,
   requireUsableConfig,
   assertMemoryRepoUsable,
   sanitizeConfigForOutput,

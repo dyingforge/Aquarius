@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { configureLogging, createLogger, isAquariusError } from '@aquarius/core';
+import { configureLogging, createLogger, isAquariusError, loadLocalEnvFile } from '@aquarius/core';
 import { bootstrapServer } from './bootstrap.ts';
 
 const log = createLogger('main');
@@ -48,4 +48,5 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
+loadLocalEnvFile();
 await main();

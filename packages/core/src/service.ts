@@ -868,9 +868,9 @@ export class AquariusService {
         : undefined,
     );
     if (this.config.agentRuntime === 'openai' && !this.config.openaiApiKey) {
-      push('model:credentials', 'fail', 'OPENAI_API_KEY is not set', 'Export OPENAI_API_KEY in the service environment.');
+      push('model:credentials', 'fail', 'Model API key is not set', 'Set AQUARIUS_MODEL_API_KEY or OPENAI_API_KEY in the service environment.');
     } else if (this.config.agentRuntime === 'openai') {
-      push('model:credentials', 'ok', 'OPENAI_API_KEY present (value never logged)');
+      push('model:credentials', 'ok', 'Model API key present (value never logged)');
     }
 
     const git = await gitVersion();

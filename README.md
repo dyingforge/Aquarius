@@ -19,7 +19,7 @@ Aquarius 是一个**单用户、本地运行的长期记忆服务**：它每天�
 
 ## 快速开始
 
-前置：Node.js ≥ 24.10、Git、pnpm。真实模型需要 `OPENAI_API_KEY`。
+前置：Node.js ≥ 24.10、Git、pnpm。真实模型需要对应提供商的 API Key。
 
 ```bash
 pnpm install
@@ -36,13 +36,16 @@ AQUARIUS_HOME=~/.aquarius pnpm cli ask "这个项目用什么包管理器"
 
 首次启动会生成 `~/.aquarius/config.json`（含本地 API token，权限 0600）、初始化独立的记忆仓库 `~/.aquarius/memory-repo`，并自动创建错过窗口的补跑任务。
 
-接入真实模型：
+接入 DeepSeek 真实模型：复制示例并在本机填写 `.env`。`pnpm server` 和 launchd 都会读取该文件；`.env` 已被 Git 忽略。
 
 ```bash
-export OPENAI_API_KEY=sk-...        # 只放在服务进程环境里
-export AQUARIUS_MODEL=gpt-5         # 固定一个模型快照
+cp .env.example .env
+chmod 600 .env
+# 编辑 .env 中的 AQUARIUS_MODEL_API_KEY
 pnpm server
 ```
+
+`.env` 中设置 `AQUARIUS_MODEL=deepseek-flash`、`AQUARIUS_MODEL_BASE_URL=https://api.deepseek.com` 和 `AQUARIUS_MODEL_API_KEY`。现有 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 仍可用；显式的 `AQUARIUS_MODEL_*` 值优先。首次验证建议保持 `AQUARIUS_SCHEDULE_ENABLED=false`，手动指定一条脱敏会话运行 `ingest run --session <id>`，避免自动摄取全部会话。
 
 安装为常驻服务（macOS）：
 

@@ -2,6 +2,7 @@
 import { Command } from 'commander';
 import { createInterface } from 'node:readline/promises';
 import { readFile } from 'node:fs/promises';
+import { loadLocalEnvFile } from '@aquarius/core';
 import { CliError, type ApiClient, resolveClient } from './client.ts';
 import { STATUS_GLYPH, createPrinter, heading, printJson, relativeTime, table } from './output.ts';
 
@@ -669,4 +670,5 @@ async function main(): Promise<void> {
   }
 }
 
+loadLocalEnvFile();
 await main();

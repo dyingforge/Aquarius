@@ -20,7 +20,9 @@ pnpm test          # 85 个测试
 | 模式 | 配置 | 行为 |
 | --- | --- | --- |
 | 干跑（默认用于开发/测试） | `AQUARIUS_AGENT_RUNTIME=fake` | 用确定性替身产生 Agent 输出；不发网络请求、不需要 API key；所有记录标 `runtime: "fake"` |
-| 真实 | `AQUARIUS_AGENT_RUNTIME=openai` + `OPENAI_API_KEY` | 通过 `@openai/agents` 调用模型；需要 key，缺 key 时**拒绝启动**而不是半可用 |
+| 真实 | `AQUARIUS_AGENT_RUNTIME=openai` + `AQUARIUS_MODEL_API_KEY` | 通过 `@openai/agents` 调用配置的模型端点；需要 key，缺 key 时**拒绝启动**而不是半可用 |
+
+仓库根目录的 `.env` 可直接放 `AQUARIUS_MODEL`、`AQUARIUS_MODEL_BASE_URL`、`AQUARIUS_MODEL_API_KEY`；`pnpm server`、`pnpm cli` 与 launchd 均会读取。先复制 `.env.example`，填写 Key 后执行 `chmod 600 .env`。环境变量优先于 `.env`；`OPENAI_API_KEY` 和 `OPENAI_BASE_URL` 保持兼容。
 
 `doctor` 会明确报告当前模式，避免把干跑结果误当成模型输出。
 
@@ -47,6 +49,8 @@ pnpm cli ask "这个项目用什么包管理器"
 | `AQUARIUS_ACTIVE_SESSION_QUIET_SECONDS=0` | 不再延后处理「仍在写入」的会话（测试常用） |
 | `AQUARIUS_LOG_LEVEL=debug` | 更详细的脱敏日志 |
 | `AQUARIUS_MODEL=<id>` | 覆盖模型快照 |
+| `AQUARIUS_MODEL_BASE_URL=<url>` | 指定兼容模型端点，例如 DeepSeek |
+| `AQUARIUS_MODEL_API_KEY=<key>` | 指定模型提供商的 Key；不会写入配置文件或日志 |
 | `AQUARIUS_REDACTION_PATTERNS='p1;;p2'` | 追加自定义脱敏正则（`;;` 分隔） |
 | `AQUARIUS_CODEX_SESSIONS_DIR` / `_ARCHIVED_DIR` / `_SESSION_INDEX` | 指向夹具目录，而不是真实 Codex 目录 |
 

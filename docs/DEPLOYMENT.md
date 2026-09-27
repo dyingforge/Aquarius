@@ -59,7 +59,7 @@ launchd 的职责只有两件：**开机拉起**、**崩溃重启**（`KeepAlive
 
 | 字段 | 值 | 说明 |
 | --- | --- | --- |
-| `ProgramArguments` | `node --disable-warning=ExperimentalWarning <repo>/packages/server/src/main.ts` | 直接跑源码；`--disable-warning` 抑制 `node:sqlite` 的实验性提示 |
+| `ProgramArguments` | `node --disable-warning=ExperimentalWarning <repo>/packages/server/src/main.ts` | 直接跑源码；服务入口读取可选的本机 `.env` |
 | `EnvironmentVariables.AQUARIUS_HOME` | `~/.aquarius` | 配置、数据库、记忆仓库、日志都在这里 |
 | `RunAtLoad` | `true` | 登录即启动 |
 | `KeepAlive.SuccessfulExit=false` | — | 异常退出才重启（正常退出不拉起） |
@@ -67,7 +67,7 @@ launchd 的职责只有两件：**开机拉起**、**崩溃重启**（`KeepAlive
 | `StandardOutPath` / `StandardErrorPath` | `~/.aquarius/logs/*.log` | 结构化脱敏日志 |
 | `ThrottleInterval` | `30` | 崩溃重启最小间隔，避免疯狂重启 |
 
-`OPENAI_API_KEY` 不要写进 plist（plist 是明文且会被备份）。用真实模型时把 key 放进 launchd 能读到的环境变量文件，或用包装脚本注入；干跑模式则完全不需要。
+模型 Key 不要写进 plist（plist 是明文且会被备份）。用真实模型时复制 `.env.example` 到仓库根目录的 `.env`，填写 `AQUARIUS_MODEL_API_KEY` 并设权限为 0600；`.env` 已被 Git 忽略。也可由进程环境注入；干跑模式不需要 Key。
 
 ### 3.3 常用运维命令
 
@@ -81,7 +81,7 @@ curl -s http://127.0.0.1:8787/health                    # 最小健康检查（�
 
 ## 4. 配置
 
-配置来自 `~/.aquarius/config.json`（首次启动生成，0600）与环境变量；环境变量优先。
+配置来自 `~/.aquarius/config.json`（首次启动生成，0600）与环境变量；`pnpm server`、`pnpm cli` 和 launchd 会先加载可选的仓库根目录 `.env`，已有进程环境变量优先。
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -90,8 +90,9 @@ curl -s http://127.0.0.1:8787/health                    # 最小健康检查（�
 | `AQUARIUS_DB` | `$HOME/aquarius.db` | SQLite 路径 |
 | `AQUARIUS_HOST` / `AQUARIUS_PORT` | `127.0.0.1` / `8787` | 只允许 loopback |
 | `AQUARIUS_MODEL` | `gpt-5` | 固定模型快照 |
+| `AQUARIUS_MODEL_BASE_URL` | OpenAI 默认端点 | 模型提供商端点；兼容 `OPENAI_BASE_URL` |
 | `AQUARIUS_AGENT_RUNTIME` | `openai` | `openai` 或 `fake`（确定性替身） |
-| `OPENAI_API_KEY` | — | `openai` 模式下必需，缺失即拒绝启动 |
+| `AQUARIUS_MODEL_API_KEY` | — | `openai` 模式下必需；兼容 `OPENAI_API_KEY`，Key 不写入 `config.json` |
 | `AQUARIUS_TRACING` | `false` | 远程 tracing；默认关闭 |
 | `AQUARIUS_SCHEDULE_ENABLED` / `_HOUR` / `_MINUTE` / `AQUARIUS_TIMEZONE` | `true` / `3` / `0` / `Asia/Shanghai` | 每日批次 |
 | `AQUARIUS_ACTIVE_SESSION_QUIET_SECONDS` | `120` | 源文件多久没变才认为「写完了」 |
@@ -152,7 +153,7 @@ pnpm cli doctor
 - [ ] `pnpm typecheck && pnpm test` 全绿。
 - [ ] `aquarius doctor` 无 `fail`；`search-index` 与 `memory-files` 无 `warn`。
 - [ ] 记忆仓库位于应用仓库之外，且已纳入备份。
-- [ ] `OPENAI_API_KEY` 不在 plist、不在 Git、不在日志里（用环境变量或包装脚本注入）。
+- [ ] 模型 Key 不在 plist、Git、配置文件或日志里；本机 `.env` 权限为 0600。
 - [ ] 远程 tracing 保持关闭（除非明确需要，且清楚它会外发数据）。
 - [ ] 试跑一次真实场景：`ingest run` → `ask` → `memory correct`（预览并取消）→ `review list`。
 - [ ] launchd 已加载并验证重启行为：`launchctl kickstart -k` 后 `/health` 恢复正常。

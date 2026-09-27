@@ -7,9 +7,16 @@ import { ensureDir, exists, readTextIfExists, writeFileAtomic } from './util/fsx
 import { DEFAULT_TIME_ZONE } from './util/time.ts';
 import { newTokenId } from './util/ids.ts';
 import { randomBytes } from 'node:crypto';
+import { existsSync } from 'node:fs';
 
 /** Application code repository root — the memory repository must live outside it. */
-export const APP_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
+export const APP_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+/** 仅在应用入口加载本机 .env；调用方已有环境变量保持优先。 */
+export function loadLocalEnvFile(): void {
+  const path = join(APP_REPO_ROOT, '.env');
+  if (existsSync(path)) process.loadEnvFile(path);
+}
 
 export const SERVICE_VERSION = '0.1.0';
 
@@ -46,6 +53,7 @@ export interface AquariusConfig {
   host: string;
   port: number;
   model: string;
+  modelBaseUrl: string | null;
   agentRuntime: AgentRuntimeMode;
   openaiApiKey: string | null;
   tracing: boolean;
@@ -81,6 +89,7 @@ interface RawConfigFile {
   host?: string;
   port?: number;
   model?: string;
+  modelBaseUrl?: string;
   agentRuntime?: AgentRuntimeMode;
   tracing?: boolean;
   apiToken?: string;
@@ -183,9 +192,14 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Loade
   const databasePath = resolve(str(env.AQUARIUS_DB) ?? file.databasePath ?? join(home, 'aquarius.db'));
 
   const model = str(env.AQUARIUS_MODEL) ?? file.model ?? 'gpt-5';
+  const modelBaseUrl = env.AQUARIUS_MODEL_BASE_URL !== undefined
+    ? str(env.AQUARIUS_MODEL_BASE_URL) ?? null
+    : str(env.OPENAI_BASE_URL) ?? file.modelBaseUrl ?? null;
   const agentRuntime =
     (str(env.AQUARIUS_AGENT_RUNTIME) as AgentRuntimeMode | undefined) ?? file.agentRuntime ?? 'openai';
-  const openaiApiKey = str(env.OPENAI_API_KEY) ?? null;
+  const openaiApiKey = env.AQUARIUS_MODEL_API_KEY !== undefined
+    ? str(env.AQUARIUS_MODEL_API_KEY) ?? null
+    : str(env.OPENAI_API_KEY) ?? null;
 
   const sources: SourcePaths = {
     codexSessionsDir: resolve(
@@ -237,6 +251,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Loade
     host,
     port,
     model,
+    modelBaseUrl,
     agentRuntime,
     openaiApiKey,
     tracing: bool(env.AQUARIUS_TRACING) ?? file.tracing ?? false,
@@ -265,6 +280,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Loade
       port: config.port,
       host: config.host,
       model: config.model,
+      ...(config.modelBaseUrl ? { modelBaseUrl: config.modelBaseUrl } : {}),
       agentRuntime: config.agentRuntime,
       databasePath: config.databasePath,
       memoryRepoPath: config.memoryRepoPath,
@@ -289,9 +305,9 @@ function collectIssues(config: AquariusConfig, issues: ConfigIssue[]): void {
   if (config.agentRuntime === 'openai' && !config.openaiApiKey) {
     issues.push({
       field: 'openaiApiKey',
-      message: 'OPENAI_API_KEY is required because the agent runtime is "openai".',
+      message: 'A model API key is required because the agent runtime is "openai".',
       actionable:
-        'Export OPENAI_API_KEY, put it in the service environment, or set AQUARIUS_AGENT_RUNTIME=fake for a dry-run instance with no model calls.',
+        'Set AQUARIUS_MODEL_API_KEY (or OPENAI_API_KEY) in the service environment, or set AQUARIUS_AGENT_RUNTIME=fake for a dry-run instance.',
     });
   }
 
@@ -340,8 +356,31 @@ function collectIssues(config: AquariusConfig, issues: ConfigIssue[]): void {
     issues.push({
       field: 'model',
       message: 'No model snapshot is configured.',
-      actionable: 'Set AQUARIUS_MODEL to a pinned OpenAI model id.',
+      actionable: 'Set AQUARIUS_MODEL to a model id supported by the configured provider.',
     });
+  }
+
+  if (config.agentRuntime === 'openai' && config.model.startsWith('deepseek-') && config.modelBaseUrl === null) {
+    issues.push({
+      field: 'modelBaseUrl',
+      message: 'DeepSeek models require an explicit Base URL.',
+      actionable: 'Set AQUARIUS_MODEL_BASE_URL=https://api.deepseek.com before starting the service.',
+    });
+  }
+
+  if (config.modelBaseUrl !== null) {
+    try {
+      const url = new URL(config.modelBaseUrl);
+      const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+      if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) ||
+        url.username || url.password || url.search || url.hash) throw new Error('unsafe URL');
+    } catch {
+      issues.push({
+        field: 'modelBaseUrl',
+        message: 'Model Base URL must be HTTPS (or local HTTP) without credentials, query or fragment.',
+        actionable: 'Set AQUARIUS_MODEL_BASE_URL to a provider endpoint such as https://api.deepseek.com.',
+      });
+    }
   }
 
   if (!Number.isInteger(config.schedule.hour) || config.schedule.hour < 0 || config.schedule.hour > 23) {
