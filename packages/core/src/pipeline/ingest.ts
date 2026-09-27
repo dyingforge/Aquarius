@@ -541,7 +541,8 @@ export class IngestService {
         declaredAuthority: observation.authority,
         confidence: observation.confidence,
         sensitivity: observation.sensitivity,
-        citedEvidence: cited.map((item) => ({ kind: item.kind, verified: item.verified })),
+        citedEvidence: cited.map((item) => ({ kind: item.kind, verified: item.verified, snippet: item.snippet })),
+        claimText: observation.body,
         distinctSupportingCaseIds: [...supportingCases],
         contradictingCaseIds: target?.frontmatter.contradicting_case_ids ?? [],
         hasUnresolvedConflict: operationName === 'conflict' || this.#hasOpenConflict(target?.frontmatter.id ?? null),
@@ -604,7 +605,7 @@ export class IngestService {
       // A duplicate whose target is still live is not worthless: the same statement
       // recurring in a *new* case is exactly what independent-case counting needs, so
       // it strengthens the existing memory instead of being dropped.
-      if (operationName === 'duplicate' && target) {
+      if (operationName === 'duplicate' && target && gate.outcome === 'active') {
         const strengthened = this.#buildRecord({
           observation,
           gate,
@@ -627,7 +628,7 @@ export class IngestService {
         continue;
       }
 
-      if (operationName === 'noop' || operationName === 'duplicate') continue;
+      if (operationName === 'noop' || (operationName === 'duplicate' && gate.outcome === 'reject')) continue;
 
       // Changing an existing profile/strategy without first-party evidence waits for a human.
       if (
@@ -691,6 +692,25 @@ export class IngestService {
           },
           dedupeKey: `promotion:${candidate.frontmatter.id}:${input.caseRecord.caseId}`,
         });
+        continue;
+      }
+
+      if (gate.outcome === 'candidate') {
+        const candidate = this.#buildRecord({
+          observation,
+          gate,
+          status: 'candidate',
+          target: null,
+          id: candidateIdFor(observation),
+          operation,
+          caseRecord: input.caseRecord,
+          session: input.session,
+          cited,
+          now,
+        });
+        plan.upserts.push({ record: candidate });
+        planned.set(candidate.frontmatter.id, candidate);
+        plan.writtenMemoryIds.push(candidate.frontmatter.id);
         continue;
       }
 

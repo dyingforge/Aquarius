@@ -69,6 +69,10 @@ function orderFrontmatter(frontmatter: MemoryFrontmatter): Record<string, unknow
   if (frontmatter.review_flags.length > 0) ordered.review_flags = frontmatter.review_flags;
   if (frontmatter.keywords.length > 0) ordered.keywords = frontmatter.keywords;
   if (frontmatter.skill) ordered.skill = frontmatter.skill;
+  if (frontmatter.skill_version) ordered.skill_version = frontmatter.skill_version;
+  if (frontmatter.revises_skill_id) ordered.revises_skill_id = frontmatter.revises_skill_id;
+  if (frontmatter.base_commit_sha) ordered.base_commit_sha = frontmatter.base_commit_sha;
+  if (frontmatter.base_content_hash) ordered.base_content_hash = frontmatter.base_content_hash;
   return ordered;
 }
 

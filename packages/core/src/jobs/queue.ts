@@ -87,7 +87,10 @@ export class JobQueue {
     try {
       this.#logger.info('job started', { job: job.jobId, kind: job.kind, trigger: job.trigger, attempt: job.attempts });
       await this.#handler(job, controller.signal);
-      this.#jobs.markDone(job.jobId, { stats: { durationMs: Date.now() - startedAt } });
+      const status = this.#jobs.get(job.jobId)?.status;
+      if (status === 'running' || status === 'committing') {
+        this.#jobs.markDone(job.jobId, { stats: { durationMs: Date.now() - startedAt } });
+      }
       this.#logger.info('job finished', { job: job.jobId, kind: job.kind, durationMs: Date.now() - startedAt });
     } catch (error) {
       const code = (error as { code?: string }).code ?? 'job_failed';

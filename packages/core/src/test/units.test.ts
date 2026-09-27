@@ -76,6 +76,8 @@ test('authority is recomputed from evidence rather than trusted from the model',
   assert.equal(verifyAuthority('user_explicit', []).authority, 'inferred');
   assert.equal(verifyAuthority('user_explicit', [{ kind: 'tool_result', verified: true }]).authority, 'tool_verified');
   assert.equal(verifyAuthority('inferred', [{ kind: 'user_message', verified: false }]).authority, 'user_explicit');
+  assert.equal(verifyAuthority('user_explicit', [{ kind: 'user_message', verified: false, snippet: '我们统一使用 pnpm' }], '这个项目已发布成功').authority, 'inferred');
+  assert.equal(verifyAuthority('inferred', [{ kind: 'user_message', verified: false, snippet: '我们统一使用 pnpm' }], '我们统一使用 pnpm').authority, 'user_explicit');
 });
 
 test('gate: one valid evidence item is enough for an experience, but not for an inferred profile', () => {
@@ -173,11 +175,11 @@ test('gate: conflicts, sensitivity and missing evidence never auto-promote', () 
 });
 
 test('gate: skill candidates need three successful independent cases across two task features', () => {
-  const cases = (count: number, features: string[][]): { caseId: string; features: string[]; successfulEvidenceCount: number }[] =>
+  const cases = (count: number, features: string[][]): { caseId: string; features: string[]; hasConfirmedSuccess: boolean }[] =>
     Array.from({ length: count }, (_, index) => ({
       caseId: `case_${index + 1}`,
       features: features[index] ?? [],
-      successfulEvidenceCount: 1,
+      hasConfirmedSuccess: true,
     }));
 
   const tooFew = applySkillGate({

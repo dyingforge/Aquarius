@@ -55,6 +55,7 @@ export async function projectFromGit(input: {
   const snapshot = await input.repository.snapshot(input.head);
   const entries: MemoryIndexEntry[] = snapshot.records.map((record) => toIndexEntry(record, snapshot.head));
   input.projection.replaceAll(entries, snapshot.head);
+  input.projection.replaceCaseOutcomes(snapshot.outcomes);
   const summary = buildSummary({
     records: snapshot.records,
     evidence: snapshot.evidence,

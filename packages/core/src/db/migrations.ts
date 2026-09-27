@@ -231,6 +231,27 @@ export const MIGRATIONS: Migration[] = [
        )`,
     ],
   },
+  {
+    version: 2,
+    name: 'case_outcomes',
+    statements: [
+      `CREATE TABLE IF NOT EXISTS case_outcomes (
+         outcome_id TEXT PRIMARY KEY,
+         case_id TEXT NOT NULL,
+         strategy_id TEXT NOT NULL,
+         attempt_id TEXT NOT NULL,
+         result TEXT NOT NULL,
+         rule_id TEXT NOT NULL,
+         evidence_ids TEXT NOT NULL,
+         source_event_ids TEXT NOT NULL,
+         task_features TEXT NOT NULL,
+         recorded_by TEXT NOT NULL,
+         supersedes TEXT,
+         recorded_at TEXT NOT NULL
+       )`,
+      `CREATE INDEX IF NOT EXISTS case_outcomes_case_strategy_idx ON case_outcomes (case_id, strategy_id)`,
+    ],
+  },
 ];
 
 export const LATEST_SCHEMA_VERSION = MIGRATIONS.reduce((max, migration) => Math.max(max, migration.version), 0);

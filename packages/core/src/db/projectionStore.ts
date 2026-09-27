@@ -3,6 +3,7 @@ import { nowIso } from '../util/time.ts';
 import { augmentForIndex, buildMatchQuery } from '../query/ftsText.ts';
 import type { Authority, Confidence, MemoryKind, MemoryStatus, Sensitivity } from '../memory/schema.ts';
 import { createLogger } from '../util/logger.ts';
+import type { CaseOutcome } from '../gates/caseOutcome.ts';
 
 const log = createLogger('store:projection');
 
@@ -98,6 +99,35 @@ export class ProjectionStore {
 
   constructor(db: AquariusDatabase) {
     this.#db = db;
+  }
+
+  replaceCaseOutcomes(outcomes: CaseOutcome[]): void {
+    this.#db.transaction(() => {
+      this.#db.run('DELETE FROM case_outcomes');
+      const insert = this.#db.prepare(
+        `INSERT INTO case_outcomes (outcome_id, case_id, strategy_id, attempt_id, result, rule_id, evidence_ids, source_event_ids, task_features, recorded_by, supersedes, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const item of outcomes) {
+        insert.run(item.outcome_id, item.case_id, item.strategy_id, item.attempt_id, item.result,
+          item.rule_id, JSON.stringify(item.evidence_ids), JSON.stringify(item.source_event_ids), JSON.stringify(item.task_features), item.recorded_by, item.supersedes, item.recorded_at);
+      }
+    });
+  }
+
+  listCaseOutcomes(caseId: string): CaseOutcome[] {
+    return this.#db.all<{
+      outcome_id: string; case_id: string; strategy_id: string; attempt_id: string;
+      result: CaseOutcome['result']; rule_id: CaseOutcome['rule_id']; evidence_ids: string; source_event_ids: string; task_features: string;
+      recorded_by: string; supersedes: string | null; recorded_at: string;
+    }>('SELECT * FROM case_outcomes WHERE case_id = ? ORDER BY recorded_at ASC', [caseId]).map((row) => ({
+      outcome_id: row.outcome_id, case_id: row.case_id, strategy_id: row.strategy_id,
+      attempt_id: row.attempt_id, result: row.result, rule_id: row.rule_id,
+      evidence_ids: JSON.parse(row.evidence_ids) as string[], recorded_by: row.recorded_by,
+      source_event_ids: JSON.parse(row.source_event_ids) as string[],
+      task_features: JSON.parse(row.task_features) as string[],
+      recorded_at: row.recorded_at, supersedes: row.supersedes,
+    }));
   }
 
   /** Atomically swaps the whole projection. */

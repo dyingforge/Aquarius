@@ -255,6 +255,25 @@ test('skill routes expose candidates and require an approval HEAD', async () => 
   });
 });
 
+test('outcome and evaluation endpoints validate inputs before writing', async () => {
+  await withServer(async ({ env, request }) => {
+    const head = await env.service.store.head();
+    const outcome = await request({
+      path: '/v1/cases/case_missing/outcomes', method: 'POST',
+      body: { strategyId: 'str_missing', attemptId: 'one', result: 'success', evidenceIds: ['ev_missing'], expectedHead: head },
+    });
+    assert.equal(outcome.status, 422);
+    const suite = await request({
+      path: '/v1/skills/evaluation-suites', method: 'POST',
+      body: { suite: { strategy_id: 'str_missing', version: 1, cases: [] }, expectedHead: head },
+    });
+    assert.equal(suite.status, 422);
+    const evaluation = await request({ path: '/v1/skills/skl_missing/evaluate', method: 'POST', body: {} });
+    assert.equal(evaluation.status, 404);
+    assert.equal(await env.service.store.head(), head);
+  });
+});
+
 test('ingestion can be triggered and inspected over HTTP', async () => {
   await withServer(async ({ env, request }) => {
     const path = await writeCodexSession(env.root, {

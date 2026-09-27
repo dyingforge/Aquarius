@@ -48,12 +48,12 @@
 | `security/` | 确定性密钥检测与会话预清洗 | `redact.ts`、`sanitizeSession.ts` |
 | `sources/` | 会话来源契约与 Codex 实现 | `adapter.ts`、`registry.ts`、`codex/parse.ts`、`codex/codexAdapter.ts` |
 | `agents/` | 四个 Agent 的 I/O 契约、提示词、runtime | `contracts.ts`、`prompts.ts`、`runtime.ts`（预算包装）、`openaiRuntime.ts`、`fakeRuntime.ts`、`contradiction.ts` |
-| `gates/` | 确定性门禁 | `promotion.ts`（`applyPromotionGate` / `applySkillGate` / `verifyAuthority`） |
+| `gates/` | 确定性门禁 | `promotion.ts`、`caseOutcome.ts`（结果有效性） |
 | `pipeline/` | 摄取流水线 | `ingest.ts` |
 | `query/` | FTS 文本处理与检索问答 | `ftsText.ts`（bigram 增强）、`retrieval.ts` |
 | `corrections/` | 修正预览与确认 | `service.ts` |
 | `reviews/` | 审查决策 | `service.ts` |
-| `skills/` | Skill 候选、发布、安装、回滚 | `service.ts` |
+| `skills/` | Skill 候选、评测、修订、发布与回滚 | `service.ts`、`evaluation.ts` |
 | `jobs/` | 队列、调度、对账 | `queue.ts`、`scheduler.ts`、`reconcile.ts` |
 | `service.ts` | 组合根：API/CLI 的唯一入口 | `AquariusService` |
 
@@ -86,6 +86,8 @@ discover (adapter)
   → 重建 FTS 投影与 summary
   → 检查 Skill 候选条件 → 需要则入队合成任务
 ```
+
+任务结果由用户随后以 `case-outcome` 明确确认，记录到 `outcomes/`，再重算 Skill 候选资格。一次成功的工具调用与普通用户消息只构成来源证据，不构成任务成功。`duplicate` 强化也须先经过晋升门禁。
 
 一个 session 的所有产出（记忆、证据、review 文件、audit、summary）在**同一个 commit** 里，所以「HEAD 是什么状态」永远是一致的。
 
@@ -149,6 +151,10 @@ superseded_by: <id|null>
 review_flags: [...]          # 非空 = 异常待审，不可发布
 keywords: [...]
 skill: {...}                 # 仅 kind=skill
+skill_version: 2             # 发布版单调递增，回滚也产生新版本
+revises_skill_id: skl_...    # 仅修订候选；指向稳定发布 ID
+base_commit_sha: ...         # 修订候选创建时的基线仓库提交
+base_content_hash: ...       # 基线发布内容哈希
 ```
 
 校验规则（超出字段类型的部分）：
@@ -158,6 +164,9 @@ skill: {...}                 # 仅 kind=skill
 - `active` 不允许带已关闭的 `valid_to`（关闭有效期必须改状态）。
 - `inferred` + `high` 必须至少引用一个支撑 case。
 - `kind=skill` 必须有 `skill` 块；非 skill 不允许有。
+- 修订候选必须同时记录目标 Skill ID、基线提交和内容哈希。
+
+`outcomes/<case>/<outcome>.json` 保存显式任务结果、证据与来源事件 ID、任务特征及修正关系；`evaluations/suites/<strategy>.json` 固定独立任务集；`evaluations/reports/<report>.json` 保存候选/基线哈希、模型、预算、逐场景结果及门禁结论。三者由 `MemoryRepository.snapshot()` 校验，均不会进入问答可读目录。
 
 ### 4.2 commit 契约
 
@@ -184,11 +193,12 @@ trailer 是启动对账的唯一依据：Git 提交成功但 SQLite 未更新时
 | `schema_migrations` | 迁移版本 | — |
 | `sessions` / `session_links` / `events` | 摄取 checkpoint、去重、根线程归并 | 否（但重建代价是重新扫一遍源文件） |
 | `cases` / `case_evidence` | case 计数与证据索引 | 部分（证据正文在 Git） |
+| `case_outcomes` | `outcomes/` 的查询投影 | **是**（从 Git HEAD 重建） |
 | `jobs` | 任务、重试、commit 映射 | 否（运行状态） |
 | `git_commits` | Git ↔ 任务台账 | 是（从 `git log` 重建） |
 | `reviews` | 预览、审查决定与审批 | 部分（review 文件在 Git） |
 | `memory_index` / `memory_fts` | 检索投影 | **是**（从 Git HEAD 重建） |
-| `skill_publications` | 发布版本、安装路径与哈希 | 是（可从 Git 历史重建） |
+| `skill_publications` | 发布版本、安装路径与哈希 | 是（版本从 Git frontmatter，安装状态从受管文件重建） |
 | `scheduler_state` | 上次自动批次的自然日 | 否（运行状态） |
 | `api_tokens` | token 元数据（只存哈希） | 否（凭据来自配置文件） |
 
@@ -201,6 +211,7 @@ trailer 是启动对账的唯一依据：Git 提交成功但 SQLite 未更新时
 | `session_id` / `event_id` / `root_thread_id` | 来源（Codex）提供 | 来源稳定；续聊通过 `parent_thread_id`/`forked_from_id` 归并到根线程 |
 | `case_id` | `case_<ULID>` | 每个根线程一个，永久不变 |
 | `evidence_id` | `ev_<sha256 派生>` | **内容派生**，同一事件永远同一个 ID（幂等的基础） |
+| `outcome_id` | `out_<sha256 派生>` | 同一次确认重复提交不生成第二条结果；修正追加新 ID |
 | 记忆 ID | `exp_/pro_/str_/skl_ + ULID` | 创建时确定，跨状态变更保持不变 |
 | review 候选 ID | `cnd_<sha256 派生>` | 内容派生，重复运行复用同一候选文件 |
 

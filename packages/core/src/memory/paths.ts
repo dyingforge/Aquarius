@@ -28,6 +28,9 @@ export const TREE_DIRECTORIES = [
   'archive/experiences',
   'archive/strategies',
   'evidence',
+  'outcomes',
+  'evaluations/suites',
+  'evaluations/reports',
   'reviews',
   'skills/candidates',
   'skills/published',
@@ -91,6 +94,18 @@ export function evidencePath(caseId: string, evidenceId: string): string {
   return `evidence/${caseId}/${evidenceId}.md`;
 }
 
+export function outcomePath(caseId: string, outcomeId: string): string {
+  return `outcomes/${caseId}/${outcomeId}.json`;
+}
+
+export function evaluationSuitePath(strategyId: string): string {
+  return `evaluations/suites/${strategyId}.json`;
+}
+
+export function evaluationReportPath(reportId: string): string {
+  return `evaluations/reports/${reportId}.json`;
+}
+
 export function reviewPath(reviewId: string): string {
   return `reviews/${reviewId}.md`;
 }
@@ -137,6 +152,8 @@ It is written only by the Aquarius service through validated, committed changes.
 - \`candidates/\` — memories that are not yet promoted, plus quarantined ones
 - \`archive/\` — memories that left the current view (superseded, forgotten, retired, rejected)
 - \`evidence/\` — redacted supporting evidence fragments referenced by memories
+- \`outcomes/\` — explicit task-result decisions for strategy attempts
+- \`evaluations/\` — fixed task suites and candidate quality reports
 - \`reviews/\` — user decisions recorded as auditable files
 - \`skills/\` — skill candidates, published skills and retired skills
 - \`audit/\` — per-job ingestion and mutation audit records

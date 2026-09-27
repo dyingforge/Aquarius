@@ -13,7 +13,9 @@ export interface PromotionGateContext {
   confidence: 'high' | 'medium' | 'low';
   sensitivity: 'public' | 'personal' | 'sensitive';
   /** Evidence actually cited, resolved from the sanitized session. */
-  citedEvidence: { kind: 'user_message' | 'tool_result'; verified: boolean }[];
+  citedEvidence: { kind: 'user_message' | 'tool_result'; verified: boolean; snippet?: string }[];
+  /** 待写入的主张，用来核对是否真由用户原话直接支持。 */
+  claimText?: string;
   /** Distinct root-thread cases supporting this memory, including the current one. */
   distinctSupportingCaseIds: string[];
   contradictingCaseIds: string[];
@@ -49,11 +51,18 @@ export const PROMOTION_RULES = {
 export function verifyAuthority(
   declared: PromotionGateContext['declaredAuthority'],
   citedEvidence: PromotionGateContext['citedEvidence'],
+  claimText?: string,
 ): { authority: PromotionGateContext['declaredAuthority']; reason: string } {
   if (citedEvidence.length === 0) {
     return { authority: 'inferred', reason: 'No cited evidence could be resolved; authority downgraded to inferred.' };
   }
-  if (citedEvidence.some((evidence) => evidence.kind === 'user_message')) {
+  const normalizedClaim = claimText?.replace(/\s+/g, '').trim();
+  if (citedEvidence.some((evidence) => {
+    if (evidence.kind !== 'user_message') return false;
+    if (!normalizedClaim) return true;
+    const snippet = evidence.snippet?.replace(/\s+/g, '').trim() ?? '';
+    return snippet.length >= 8 && snippet.includes(normalizedClaim);
+  })) {
     return { authority: 'user_explicit', reason: 'A cited user message states this directly.' };
   }
   if (citedEvidence.some((evidence) => evidence.kind === 'tool_result' && evidence.verified)) {
@@ -78,7 +87,7 @@ export function verifyAuthority(
  */
 export function applyPromotionGate(context: PromotionGateContext): GateDecision {
   const reasons: string[] = [];
-  const verified = verifyAuthority(context.declaredAuthority, context.citedEvidence);
+  const verified = verifyAuthority(context.declaredAuthority, context.citedEvidence, context.claimText);
   reasons.push(verified.reason);
 
   if (context.citedEvidence.length === 0) {
@@ -176,8 +185,8 @@ export interface SkillGateContext {
   supportingCases: {
     caseId: string;
     features: string[];
-    /** Successful, user- or tool-sourced evidence only. */
-    successfulEvidenceCount: number;
+    /** 该策略在此独立案例中有可审计且无冲突的成功结果。 */
+    hasConfirmedSuccess: boolean;
   }[];
   hasUnresolvedConflict: boolean;
 }
@@ -214,7 +223,7 @@ export function applySkillGate(context: SkillGateContext): SkillGateDecision {
 
   const distinctCaseIds = new Set(context.supportingCases.map((entry) => entry.caseId));
   const distinctFeatures = new Set(context.supportingCases.flatMap((entry) => entry.features).filter((f) => f !== ''));
-  const casesWithSuccess = context.supportingCases.filter((entry) => entry.successfulEvidenceCount > 0).length;
+  const casesWithSuccess = context.supportingCases.filter((entry) => entry.hasConfirmedSuccess).length;
 
   if (casesWithSuccess < PROMOTION_RULES.skillMinDistinctCases) {
     reasons.push(

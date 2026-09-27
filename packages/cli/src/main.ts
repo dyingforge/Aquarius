@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import { createInterface } from 'node:readline/promises';
+import { readFile } from 'node:fs/promises';
 import { CliError, type ApiClient, resolveClient } from './client.ts';
 import { STATUS_GLYPH, createPrinter, heading, printJson, relativeTime, table } from './output.ts';
 
@@ -525,12 +526,67 @@ skill
       const flags = value['reviewFlags'] as string[];
       if (flags.length > 0) printer.write(`\nquarantine flags: ${flags.join(', ')}`);
       const conflict = value['nameConflict'] as { path: string; managed: boolean } | null;
+      const evaluation = value['evaluation'] as { status: string; reportId: string | null; scope: string | null };
+      printer.write(`evaluation: ${evaluation.status}${evaluation.reportId ? ` (${evaluation.reportId})` : ''}`);
+      if (evaluation.scope) printer.write(`evaluation scope: ${evaluation.scope}`);
       if (conflict) {
         printer.write(
           `\nname conflict at ${conflict.path} (${conflict.managed ? 'managed by Aquarius' : 'NOT managed by Aquarius — publishing will be refused'})`,
         );
       }
     });
+  });
+
+skill
+  .command('suite-set')
+  .argument('<jsonFile>')
+  .description('register a versioned, independent release-checklist evaluation suite')
+  .action(async (jsonFile: string) => {
+    const api = await client();
+    const suite = JSON.parse(await readFile(jsonFile, 'utf8')) as Record<string, unknown>;
+    const result = await api.post<Record<string, unknown>>('/v1/skills/evaluation-suites', { suite, expectedHead: await currentHead(api) });
+    output(result, (value: typeof result) => process.stdout.write(`Registered evaluation suite v${String(value['version'])}.\n`));
+  });
+
+skill
+  .command('evaluate')
+  .argument('<skillId>')
+  .description('compare a candidate and its baseline on the registered task suite')
+  .action(async (skillId: string) => {
+    const api = await client();
+    const result = await api.post<Record<string, unknown>>(`/v1/skills/${encodeURIComponent(skillId)}/evaluate`, {});
+    output(result, (value: typeof result) => process.stdout.write(`Evaluation ${String(value['status'])}: ${String(value['report_id'])} (${String(value['scope'])}).\n`));
+  });
+
+skill
+  .command('report')
+  .argument('<skillId>')
+  .description('show saved evaluation reports for a skill candidate')
+  .action(async (skillId: string) => {
+    const api = await client();
+    const result = await api.get<Record<string, unknown>>(`/v1/skills/${encodeURIComponent(skillId)}/evaluation`);
+    output(result, (value: typeof result) => process.stdout.write(`${JSON.stringify(value, null, 2)}\n`));
+  });
+
+program
+  .command('case-outcome')
+  .argument('<caseId>')
+  .argument('<strategyId>')
+  .argument('<attemptId>')
+  .argument('<result>', 'success, failure or unknown')
+  .requiredOption('--evidence <ids>', 'comma-separated evidence IDs from this case')
+  .option('--supersedes <outcomeId>', 'prior outcome ID when correcting a result')
+  .description('explicitly confirm the task result for one strategy attempt')
+  .action(async (caseId: string, strategyId: string, attemptId: string, result: string, options: { evidence: string; supersedes?: string }) => {
+    if (!['success', 'failure', 'unknown'].includes(result)) throw new CliError('validation_failed', 'Result must be success, failure or unknown.', undefined, 2);
+    const api = await client();
+    const response = await api.post<Record<string, unknown>>(`/v1/cases/${encodeURIComponent(caseId)}/outcomes`, {
+      strategyId, attemptId, result,
+      evidenceIds: options.evidence.split(',').map((id) => id.trim()).filter(Boolean),
+      expectedHead: await currentHead(api), recordedBy: 'local-user',
+      ...(options.supersedes ? { supersedes: options.supersedes } : {}),
+    });
+    output(response, (value: typeof response) => process.stdout.write(`Recorded outcome ${String((value['outcome'] as Record<string, unknown>)?.['outcome_id'])}.\n`));
   });
 
 for (const [command, method, description] of [

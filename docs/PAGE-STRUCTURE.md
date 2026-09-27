@@ -33,6 +33,9 @@ aquarius [全局选项] <命令> [子命令] [参数] [选项]
 | `index rebuild` | — | 从 Git HEAD 重建 FTS 投影 | 否（只改 SQLite） |
 | `skill list` | — | 候选/已发布 Skill 与安装状态 | 否 |
 | `skill show <skillId>` | — | Skill 全文、关联策略与案例、安装目标、同名冲突 | 否 |
+| `case-outcome <caseId> <strategyId> <attemptId> <result>` | `--evidence`、可选 `--supersedes` | 显式确认或修正一次策略尝试的任务结果 | 是 |
+| `skill suite-set <jsonFile>` | — | 登记版本化、独立的评测任务集 | 是 |
+| `skill evaluate <skillId>` / `skill report <skillId>` | — | 运行受控工具评测 / 查看 Git 报告 | 仅 evaluate |
 | `skill approve <skillId>` | `--yes --note` | 发布并安装（先写 Git，再安装） | 是 |
 | `skill reject <skillId>` | `--reason` | 拒绝候选 | 是 |
 | `skill rollback <skillId>` | `--yes` | 回滚到上一已发布并安装的版本 | 是 |
@@ -82,6 +85,7 @@ Apply this correction? [y/N]
 | GET | `/v1/jobs?status&kind&limit` · `/v1/jobs/:jobId` | 任务记录（状态、尝试次数、commit、错误码） |
 | GET | `/v1/ingestions/status` | 调度状态、会话计数、最近任务、case 数、HEAD |
 | GET | `/v1/skills` · `/v1/skills/:skillId` | Skill 列表 / 详情（含安装状态与同名冲突） |
+| GET | `/v1/skills/:skillId/evaluation` | 该候选的版本化评测报告 |
 
 ### 2.2 写入
 
@@ -92,7 +96,10 @@ Apply this correction? [y/N]
 | POST | `/v1/corrections/preview` | `instruction` | 返回 `{reviewId, type, baseHead, memoryIds, affected[], diff, notes[], expiresAt}`；**不写 Git** |
 | POST | `/v1/corrections/:reviewId/confirm` | `expectedHead` | 应用预览；HEAD 不匹配 → 409 `stale_head` |
 | POST | `/v1/reviews/:reviewId/resolve` | `decision`、`expectedHead`；可选 `dryRun`、`note`、`mergedBody`、`mergedTitle` | `dryRun` 只返回 diff；应用后同一 review 不可重复执行 |
-| POST | `/v1/skills/:skillId/approve` | `expectedHead`、`approvedBy` | 静态门禁 → Git published → 安装 |
+| POST | `/v1/cases/:caseId/outcomes` | `strategyId`、`attemptId`、`result`、`evidenceIds`、`expectedHead` | 追加可审计的任务结果 |
+| POST | `/v1/skills/evaluation-suites` | `suite`、`expectedHead` | 登记评测集并为现有候选排队评测 |
+| POST | `/v1/skills/:skillId/evaluate` | — | 受控工具任务集对照评测，报告写 Git |
+| POST | `/v1/skills/:skillId/approve` | `expectedHead`、`approvedBy` | 静态门禁 + 有效质量报告 → Git published → 安装 |
 | POST | `/v1/skills/:skillId/reject` | `expectedHead`、`reason` | 拒绝候选 |
 | POST | `/v1/skills/:skillId/rollback` | `expectedHead` | 回滚到上一已发布版本并重装 |
 | POST | `/v1/skills/:skillId/retire` | `expectedHead` | 退场并移除受管安装 |
@@ -153,6 +160,9 @@ memory-repo/
 ├── candidates/                     未晋升 / 待审（问答不可读）
 ├── archive/                        已移出视图（问答不可读）
 ├── evidence/<case_id>/<evidence_id>.md
+├── outcomes/<case_id>/<outcome_id>.json
+├── evaluations/suites/<strategy_id>.json
+├── evaluations/reports/<report_id>.json
 ├── reviews/<review_id>.md          审查留痕
 ├── skills/{candidates,published,retired}/<skill_id>.md
 └── audit/YYYY-MM-DD/<job_id>.md    每次摄取的运行记录

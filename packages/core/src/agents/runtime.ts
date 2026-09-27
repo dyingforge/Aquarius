@@ -14,6 +14,8 @@ import type {
 } from './contracts.ts';
 import type { CaseRecord } from '../db/sessionStore.ts';
 import type { SanitizedSession } from '../sources/adapter.ts';
+import type { EvaluationCase, SkillTrial } from '../skills/evaluation.ts';
+import type { SkillSpec } from '../memory/schema.ts';
 
 const log = createLogger('agents');
 
@@ -48,18 +50,25 @@ export interface SynthesizeSkillInput {
   strategy: LoadedMemory;
   cases: {
     caseId: string;
+    outcome?: 'success' | 'failure';
     title: string | null;
     features: string[];
     evidence: { kind: string; tool?: string | null; snippet: string }[];
   }[];
   existingSkillNames: string[];
+  baselineSkill?: SkillSpec | null;
+}
+
+export interface EvaluateSkillInput {
+  task: EvaluationCase;
+  skillText: string | null;
 }
 
 export interface AgentRuntimeDescription {
   mode: 'openai' | 'fake';
   model: string;
   tracing: boolean;
-  /** Tools each agent is allowed to use — always empty except for the query agent's reader. */
+  /** Tools each agent is allowed to use; the evaluator only receives isolated stubs. */
   toolPolicy: Record<string, string[]>;
 }
 
@@ -86,6 +95,7 @@ export interface AgentRuntime {
   selectRelevant(input: SelectInput): Promise<SelectionOutput>;
   answer(input: AnswerInput): Promise<QueryOutput>;
   synthesizeSkill(input: SynthesizeSkillInput): Promise<SkillDraft>;
+  evaluateSkill(input: EvaluateSkillInput): Promise<SkillTrial>;
   describe(): AgentRuntimeDescription;
 }
 
@@ -138,6 +148,10 @@ export class BudgetedAgentRuntime implements AgentRuntime {
 
   synthesizeSkill(input: SynthesizeSkillInput): Promise<SkillDraft> {
     return this.#guarded('skill_synthesizer', () => this.#inner.synthesizeSkill(input));
+  }
+
+  evaluateSkill(input: EvaluateSkillInput): Promise<SkillTrial> {
+    return this.#guarded('skill_evaluator', () => this.#inner.evaluateSkill(input));
   }
 
   async #guarded<T>(agent: string, fn: () => Promise<T>): Promise<T> {

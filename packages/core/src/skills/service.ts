@@ -17,11 +17,16 @@ import type { CommitStore } from '../db/commitStore.ts';
 import type { AgentRuntime } from '../agents/runtime.ts';
 import type { Redactor } from '../security/redact.ts';
 import { applySkillGate } from '../gates/promotion.ts';
+import { effectiveCaseOutcome } from '../gates/caseOutcome.ts';
 import { projectFromGit } from '../query/retrieval.ts';
 import { JOB_PRIORITY } from '../db/jobStore.ts';
 import { ensureDir, exists, sha256, sha256OfFile } from '../util/fsx.ts';
 import { nowIso } from '../util/time.ts';
 import { createLogger } from '../util/logger.ts';
+import { randomUUID } from 'node:crypto';
+import { evaluationReportPath, evaluationSuitePath } from '../memory/paths.ts';
+import { evaluationReportSchema, evaluationSuiteSchema, judgeEvaluation, passesEvaluationCase, type EvaluationReport, type EvaluationSuite } from './evaluation.ts';
+import { deriveId } from '../util/ids.ts';
 
 const log = createLogger('skills');
 
@@ -65,7 +70,9 @@ export interface SkillCandidateView {
   supportingCaseCount: number;
   reviewFlags: string[];
   publication: SkillPublicationRecord | null;
-  nameConflict: { path: string; managed: boolean } | null;
+  nameConflict: { path: string; managed: boolean; ownerId?: string | null } | null;
+  revisesSkillId: string | null;
+  evaluation: { status: EvaluationReport['status'] | 'missing' | 'stale'; reportId: string | null; scope: string | null };
 }
 
 export interface SkillValidationResult {
@@ -82,10 +89,7 @@ const EXECUTABLE_HINT = /```(?:bash|sh|zsh|python|javascript|js|ts)\b/;
 /**
  * Static, deterministic skill checks.
  *
- * Publication is a *format* gate, not a quality gate: PLAN §8 explicitly rules out
- * semantic evaluation or mandatory dry runs. What it does enforce is that nothing
- * with secrets, absolute machine paths or undeclared tool dependencies can be
- * published, and that a name collision is caught before install.
+ * 本函数只检查格式和静态风险；发布还要通过独立评测门禁。
  */
 export function validateSkillCandidate(input: {
   draft: {
@@ -223,10 +227,8 @@ export class SkillService {
         const caseRecord = this.#sessions.getCase(caseId);
         return {
           caseId,
-          features: caseRecord?.taskFeatures ?? [],
-          successfulEvidenceCount: this.#sessions
-            .listEvidenceForCase(caseId, { limit: 100 })
-            .filter((evidence) => evidence.verified || evidence.kind === 'user_message').length,
+          features: caseRecord?.taskFeatures ?? snapshot.outcomes.find((item) => item.case_id === caseId && item.strategy_id === memoryId)?.task_features ?? [],
+          hasConfirmedSuccess: effectiveCaseOutcome(snapshot.outcomes, caseId, record.frontmatter.id) === 'success',
         };
       });
 
@@ -238,12 +240,27 @@ export class SkillService {
           record.frontmatter.contradicting_case_ids.length > 0 || this.#hasOpenConflict(record.frontmatter.id),
       });
 
-      if (!gate.eligible) {
+      const baseline = snapshot.records.find((item) => item.frontmatter.kind === 'skill' && item.frontmatter.status === 'active' && item.frontmatter.skill?.related_strategy_ids.includes(memoryId));
+      const newOutcomes = baseline ? snapshot.outcomes.filter((item) => item.strategy_id === memoryId &&
+        (baseline.frontmatter.skill?.source_outcome_ids?.length
+          ? !baseline.frontmatter.skill.source_outcome_ids.includes(item.outcome_id)
+          : item.recorded_at > baseline.frontmatter.updated_at)) : [];
+
+      if (!gate.eligible && !baseline) {
         skipped.push({ memoryId, reasons: gate.reasons });
         continue;
       }
+      if (baseline && (record.frontmatter.status !== 'active' || gate.reasons.some((reason) => reason.includes('unresolved conflict')) || newOutcomes.length === 0)) {
+        skipped.push({ memoryId, reasons: ['No new adjudicated outcome since publication.'] });
+        continue;
+      }
       if (await this.hasCandidateFor(record.frontmatter.id)) {
-        skipped.push({ memoryId, reasons: ['A skill candidate or published skill already exists for this strategy.'] });
+        skipped.push({ memoryId, reasons: ['An unresolved candidate already exists for this strategy.'] });
+        continue;
+      }
+      if (this.#jobs.list({ kind: 'skill_synthesize', limit: 1000 }).some((job) =>
+        (job.status === 'queued' || job.status === 'running') && job.payload['strategyMemoryId'] === record.frontmatter.id)) {
+        skipped.push({ memoryId, reasons: ['A synthesis job is already queued for this strategy.'] });
         continue;
       }
 
@@ -263,7 +280,7 @@ export class SkillService {
     return snapshot.records.some(
       (record) =>
         record.frontmatter.kind === 'skill' &&
-        record.frontmatter.status !== 'rejected' &&
+        record.frontmatter.status === 'candidate' &&
         (record.frontmatter.skill?.related_strategy_ids ?? []).includes(strategyMemoryId),
     );
   }
@@ -276,12 +293,30 @@ export class SkillService {
       throw new AquariusError('not_found', `Strategy ${strategyMemoryId} does not exist at HEAD.`);
     }
 
-    const cases = strategy.frontmatter.supporting_case_ids.map((caseId) => {
+    if (await this.hasCandidateFor(strategyMemoryId)) {
+      throw new AquariusError('conflict', 'An unresolved skill candidate already exists for this strategy.');
+    }
+    const baseline = snapshot.records.find((item) => item.frontmatter.kind === 'skill' && item.frontmatter.status === 'active' && item.frontmatter.skill?.related_strategy_ids.includes(strategyMemoryId));
+    if (baseline) {
+      const newOutcomes = snapshot.outcomes.filter((item) => item.strategy_id === strategyMemoryId &&
+        (baseline.frontmatter.skill?.source_outcome_ids?.length
+          ? !baseline.frontmatter.skill.source_outcome_ids.includes(item.outcome_id)
+          : item.recorded_at > baseline.frontmatter.updated_at));
+      if (newOutcomes.length === 0) throw new AquariusError('validation_failed', 'Revision requires a new adjudicated task outcome.');
+    }
+
+    const cases = strategy.frontmatter.supporting_case_ids
+      .filter((caseId) => {
+        const result = effectiveCaseOutcome(snapshot.outcomes, caseId, strategyMemoryId);
+        return result === 'success' || (baseline && snapshot.outcomes.some((item) => item.case_id === caseId && item.strategy_id === strategyMemoryId && item.result === 'failure'));
+      })
+      .map((caseId) => {
       const caseRecord = this.#sessions.getCase(caseId);
       return {
         caseId,
+        outcome: effectiveCaseOutcome(snapshot.outcomes, caseId, strategyMemoryId) === 'success' ? 'success' as const : 'failure' as const,
         title: caseRecord?.title ?? null,
-        features: caseRecord?.taskFeatures ?? [],
+        features: caseRecord?.taskFeatures ?? snapshot.outcomes.find((item) => item.case_id === caseId && item.strategy_id === strategyMemoryId)?.task_features ?? [],
         evidence: this.#sessions
           .listEvidenceForCase(caseId, { limit: 6 })
           .filter((evidence) => evidence.verified || evidence.kind === 'user_message')
@@ -293,8 +328,20 @@ export class SkillService {
       };
     });
 
+    const gate = applySkillGate({
+      strategyStatus: strategy.frontmatter.status,
+      strategyKind: strategy.frontmatter.kind,
+      supportingCases: cases.map((item) => ({ caseId: item.caseId, features: item.features, hasConfirmedSuccess: item.outcome === 'success' })),
+      hasUnresolvedConflict: strategy.frontmatter.contradicting_case_ids.length > 0 || this.#hasOpenConflict(strategyMemoryId),
+    });
+    if (!gate.eligible && !baseline) {
+      throw new AquariusError('validation_failed', `Strategy ${strategyMemoryId} lacks confirmed successful cases: ${gate.reasons.join(' ')}`, {
+        actionable: 'Record task outcomes for three independent cases and evaluate candidates again.',
+      });
+    }
+
     const existingNames = snapshot.records
-      .filter((record) => record.frontmatter.kind === 'skill' && record.frontmatter.skill)
+      .filter((record) => record.frontmatter.kind === 'skill' && record.frontmatter.skill && record.frontmatter.id !== baseline?.frontmatter.id)
       .map((record) => record.frontmatter.skill!.name);
 
     const rawDraft = await this.#runtime.synthesizeSkill({
@@ -311,14 +358,15 @@ export class SkillService {
       },
       cases,
       existingSkillNames: existingNames,
+      baselineSkill: baseline?.frontmatter.skill ?? null,
     });
 
     // Names are identifiers, so they are folded before validation: a model (or the
     // deterministic double) must never be able to produce an un-writable candidate.
-    const draft = { ...rawDraft, name: toKebabName(rawDraft.name, strategy.frontmatter.title) };
+    const draft = { ...rawDraft, name: baseline?.frontmatter.skill?.name ?? toKebabName(rawDraft.name, strategy.frontmatter.title) };
     const validation = validateSkillCandidate({
       draft,
-      supportingCaseCount: cases.length,
+      supportingCaseCount: baseline ? Math.max(3, strategy.frontmatter.supporting_case_ids.length) : cases.length,
       existingNames,
       redactor: this.#redactor,
     });
@@ -366,8 +414,14 @@ export class SkillService {
           limitations: draft.limitations,
           tool_dependencies: draft.tool_dependencies,
           related_strategy_ids: [strategy.frontmatter.id],
-          related_case_ids: cases.map((caseRecord) => caseRecord.caseId),
+          related_case_ids: strategy.frontmatter.supporting_case_ids,
+          source_outcome_ids: snapshot.outcomes.filter((item) => item.strategy_id === strategyMemoryId).map((item) => item.outcome_id),
         },
+        ...(baseline ? {
+          revises_skill_id: baseline.frontmatter.id,
+          base_commit_sha: head!,
+          base_content_hash: snapshot.fileHashes.get(baseline.path)!,
+        } : {}),
       },
       body: renderSkillBody(draft, strategy),
       path: '',
@@ -413,6 +467,9 @@ export class SkillService {
     }
 
     await projectFromGit({ repository: this.#repository, projection: this.#projection });
+    if (snapshot.evaluationSuites.some((item) => item.strategy_id === strategyMemoryId)) {
+      this.#queueCandidateEvaluation(skillId);
+    }
     log.info('skill candidate created', { skill: skillId, flags: validation.flags.length });
     return { skillId, path, reviewFlags: validation.flags, commitSha: result.commitSha };
   }
@@ -443,31 +500,76 @@ export class SkillService {
       reviewFlags: record.frontmatter.review_flags,
       publication: this.#projection.getSkillPublication(skillId),
       nameConflict: conflict,
+      revisesSkillId: record.frontmatter.revises_skill_id ?? null,
+      evaluation: this.#evaluationState(snapshot, record),
     };
   }
 
-  list(): SkillCandidateView[] {
-    return this.#projection
-      .list({ kind: 'skill', limit: 200 })
-      .map((row) => ({
-        skillId: row.memory_id,
-        name: (JSON.parse(row.tags) as string[]).includes('skill') ? row.memory_id : row.memory_id,
-        status: row.status,
-        path: row.path,
-        purpose: row.title,
-        triggers: [],
-        inputs: [],
-        outputs: [],
-        steps: [],
-        limitations: [],
-        toolDependencies: [],
-        relatedStrategyIds: [],
-        relatedCaseIds: [],
-        supportingCaseCount: (JSON.parse(row.case_ids) as string[]).length,
-        reviewFlags: [],
-        publication: this.#projection.getSkillPublication(row.memory_id),
-        nameConflict: null,
+  async list(): Promise<SkillCandidateView[]> {
+    const snapshot = await this.#repository.snapshot();
+    return Promise.all(snapshot.records.filter((record) => record.frontmatter.kind === 'skill' && record.frontmatter.skill)
+      .map(async (record) => {
+        const skill = record.frontmatter.skill!;
+        return {
+          skillId: record.frontmatter.id,
+          name: skill.name,
+          status: record.frontmatter.status,
+          path: record.path,
+          purpose: skill.purpose,
+          triggers: skill.triggers,
+          inputs: skill.inputs,
+          outputs: skill.outputs,
+          steps: skill.steps,
+          limitations: skill.limitations,
+          toolDependencies: skill.tool_dependencies,
+          relatedStrategyIds: skill.related_strategy_ids,
+          relatedCaseIds: skill.related_case_ids,
+          supportingCaseCount: record.frontmatter.supporting_case_ids.length,
+          reviewFlags: record.frontmatter.review_flags,
+          publication: this.#projection.getSkillPublication(record.frontmatter.id),
+          nameConflict: await this.findInstalledConflict(skill.name),
+          revisesSkillId: record.frontmatter.revises_skill_id ?? null,
+          evaluation: this.#evaluationState(snapshot, record),
+        };
       }));
+  }
+
+  /** 安装投影丢失后，从 Git 版本和受管安装文件恢复其可查询状态。 */
+  async rebuildPublicationProjection(): Promise<void> {
+    const snapshot = await this.#repository.snapshot();
+    for (const record of snapshot.records.filter((item) => item.frontmatter.kind === 'skill' && item.frontmatter.skill &&
+      (item.frontmatter.status === 'active' || item.frontmatter.status === 'retired'))) {
+      const skillId = record.frontmatter.id;
+      const version = record.frontmatter.skill_version ?? 1;
+      const existing = this.#projection.getSkillPublication(skillId);
+      const history = await this.#store.fileHistory(record.path);
+      const directory = join(this.#config.skillInstallDir, record.frontmatter.skill!.name);
+      const installPath = join(directory, 'SKILL.md');
+      const owned = await this.#isManagedInstall(directory) && await this.#installedOwner(directory) === skillId;
+      const installed = owned ? await readFile(installPath, 'utf8') : null;
+      const commitSha = installed?.match(/^aquarius_commit: (.+)$/m)?.[1]?.trim() ?? history[0] ?? null;
+      const rawContent = await this.#store.readFile(record.path);
+      const expectedInstall = commitSha && rawContent ? `---\n${AQUARIUS_SKILL_MARKER}\naquarius_skill_id: ${skillId}\naquarius_commit: ${commitSha}\n---\n\n${rawContent}` : null;
+      const installedOk = owned && installed === expectedInstall;
+      const fileHash = installedOk ? await sha256OfFile(installPath) : null;
+      this.#projection.upsertSkillPublication({
+        skillId,
+        skillName: record.frontmatter.skill!.name,
+        version,
+        status: record.frontmatter.status === 'retired' ? 'retired' : installedOk ? 'installed' : 'published',
+        commitSha,
+        previousCommitSha: history[1] ?? null,
+        installPath: installedOk ? installPath : null,
+        fileHash,
+        files: fileHash ? [{ path: installPath, hash: fileHash }] : [],
+        approvedBy: existing?.approvedBy ?? null,
+        publishedAt: existing?.publishedAt ?? null,
+        installedAt: existing?.installedAt ?? null,
+        retiredAt: existing?.retiredAt ?? null,
+        rollbackOf: existing?.rollbackOf ?? null,
+        message: `Rebuilt from Git Skill v${version}`,
+      });
+    }
   }
 
   /**
@@ -502,11 +604,32 @@ export class SkillService {
       });
     }
 
+    const targetId = record.frontmatter.revises_skill_id ?? input.skillId;
+    const baseline = record.frontmatter.revises_skill_id ? snapshot.byId.get(targetId) : null;
+    if (record.frontmatter.revises_skill_id) {
+      const baseContent = await this.#store.readFile(skillPath(targetId, 'active'), record.frontmatter.base_commit_sha);
+      if (!baseline || baseline.frontmatter.status !== 'active' || !baseline.frontmatter.skill ||
+        baseline.frontmatter.skill.name !== record.frontmatter.skill.name || !baseContent ||
+        sha256(baseContent) !== record.frontmatter.base_content_hash ||
+        snapshot.fileHashes.get(baseline.path) !== record.frontmatter.base_content_hash) {
+        throw new AquariusError('stale_head', 'The published Skill baseline changed after this revision was created.', {
+          actionable: 'Generate and evaluate a revision against the current published version.',
+        });
+      }
+    }
+
     const conflict = await this.findInstalledConflict(record.frontmatter.skill.name);
-    if (conflict && !conflict.managed) {
+    const otherPublished = snapshot.records.find((item) => item.frontmatter.kind === 'skill' && item.frontmatter.status === 'active' &&
+      item.frontmatter.id !== targetId && item.frontmatter.skill?.name === record.frontmatter.skill?.name);
+    if (otherPublished) {
+      throw new AquariusError('skill_install_conflict', `Another published Skill owns the name "${record.frontmatter.skill.name}".`, {
+        actionable: 'Choose a distinct name or retire the other Skill before publishing.',
+      });
+    }
+    if (conflict && (!conflict.managed || conflict.ownerId !== targetId)) {
       throw new AquariusError(
         'skill_install_conflict',
-        `A non-Aquarius skill named "${record.frontmatter.skill.name}" already exists at ${conflict.path}.`,
+        `Skill name "${record.frontmatter.skill.name}" is owned by another installation at ${conflict.path}.`,
         {
           actionable: 'Rename the skill candidate, or move the existing skill out of the way. Aquarius never overwrites foreign skills.',
           details: { path: conflict.path },
@@ -534,22 +657,42 @@ export class SkillService {
       });
     }
 
+    const evaluation = this.#evaluationState(snapshot, record);
+    if (evaluation.status !== 'pass') {
+      throw new AquariusError('validation_failed', `Skill ${input.skillId} has no current passing quality evaluation (${evaluation.status}).`, {
+        actionable: 'Register an independent evaluation suite, run the evaluation with the real runtime, and inspect the report before approving.',
+        details: { evaluation },
+      });
+    }
+
     const published: MemoryRecord = {
       ...record,
-      frontmatter: { ...record.frontmatter, status: 'active', updated_at: nowIso(), review_flags: [] },
+      frontmatter: {
+        ...record.frontmatter,
+        id: targetId,
+        status: 'active',
+        skill_version: (baseline?.frontmatter.skill_version ?? this.#projection.getSkillPublication(targetId)?.version ?? 0) + 1,
+        updated_at: nowIso(),
+        review_flags: [],
+        revises_skill_id: undefined,
+        base_commit_sha: undefined,
+        base_content_hash: undefined,
+      },
     };
-    const targetPath = skillPath(input.skillId, 'active');
+    const targetPath = skillPath(targetId, 'active');
     const writes: FileChange[] = [
       { path: record.path, content: null },
       { path: targetPath, content: serializeRecord(published) },
     ];
 
-    const version = (this.#projection.getSkillPublication(input.skillId)?.version ?? 0) + 1;
+    const version = published.frontmatter.skill_version!;
+    const previous = this.#projection.getSkillPublication(targetId);
     const result = await this.#store.commit(writes, {
       expectedHead: currentHead,
       subject: `Publish skill ${record.frontmatter.skill.name} v${version}`,
       body: [
-        `Skill: ${input.skillId}`,
+        `Skill: ${targetId}`,
+        ...(targetId !== input.skillId ? [`Revision candidate: ${input.skillId}`] : []),
         `Approved by: ${input.approvedBy}`,
         input.note ? `Note: ${input.note}` : 'Note: (none)',
         `Supporting cases: ${record.frontmatter.supporting_case_ids.length}`,
@@ -570,17 +713,16 @@ export class SkillService {
       type: 'skill_approval',
       status: 'approved',
       baseHead: result.commitSha,
-      memoryIds: [input.skillId],
-      proposal: { skillId: input.skillId, name: record.frontmatter.skill.name, version, commitSha: result.commitSha },
+      memoryIds: targetId === input.skillId ? [targetId] : [targetId, input.skillId],
+      proposal: { skillId: targetId, candidateId: input.skillId, name: record.frontmatter.skill.name, version, commitSha: result.commitSha },
       expiresAt: null,
-      dedupeKey: `skill_approval:${input.skillId}:v${version}`,
+      dedupeKey: `skill_approval:${targetId}:v${version}`,
       jobId: null,
     });
     await projectFromGit({ repository: this.#repository, projection: this.#projection });
 
-    const previous = this.#projection.getSkillPublication(input.skillId);
     const install = await this.#install({
-      skillId: input.skillId,
+      skillId: targetId,
       name: record.frontmatter.skill.name,
       content: serializeRecord(published),
       commitSha: result.commitSha,
@@ -589,7 +731,158 @@ export class SkillService {
       previousCommitSha: previous?.commitSha ?? null,
     });
 
-    return { skillId: input.skillId, commitSha: result.commitSha, ...install, version };
+    return { skillId: targetId, commitSha: result.commitSha, ...install, version };
+  }
+
+  /** 固定的任务集先入 Git；候选合成器读不到它。 */
+  async setEvaluationSuite(input: { suite: EvaluationSuite; expectedHead: string | null }): Promise<{ commitSha: string; version: number }> {
+    const snapshot = await this.#repository.snapshot();
+    if (snapshot.head !== input.expectedHead) throw new AquariusError('stale_head', 'Evaluation suite update requires the current HEAD.');
+    const checked = evaluationSuiteSchema.safeParse(input.suite);
+    if (!checked.success) throw new AquariusError('validation_failed', `Invalid evaluation suite: ${checked.error.issues.map((item) => item.message).join('; ')}`, {
+      actionable: 'Provide a versioned release-checklist suite with applicable, inapplicable, and failure cases.',
+    });
+    const suite = checked.data;
+    const strategy = snapshot.byId.get(suite.strategy_id);
+    if (!strategy || strategy.frontmatter.kind !== 'strategy') throw new AquariusError('not_found', 'Evaluation strategy does not exist.');
+    const prior = snapshot.evaluationSuites.find((item) => item.strategy_id === suite.strategy_id);
+    if (prior && suite.version !== prior.version + 1) {
+      throw new AquariusError('validation_failed', 'Evaluation suite version must increase by one.');
+    }
+    if (!prior && suite.version !== 1) throw new AquariusError('validation_failed', 'First evaluation suite version must be 1.');
+    if (suite.cases.some((item) => item.source_case_id && strategy.frontmatter.supporting_case_ids.includes(item.source_case_id))) {
+      throw new AquariusError('validation_failed', 'Evaluation cases cannot reuse the strategy synthesis cases.');
+    }
+    const serialized = JSON.stringify(suite);
+    if (this.#redactor.redact(serialized).redacted) {
+      throw new AquariusError('validation_failed', 'Evaluation suite contains credential-shaped content.');
+    }
+    const committed = await this.#store.commit([{ path: evaluationSuitePath(suite.strategy_id), content: `${JSON.stringify(suite, null, 2)}\n` }], {
+      expectedHead: snapshot.head,
+      subject: `Register evaluation suite v${suite.version}`,
+      trailers: { kind: 'skill-evaluation-suite' },
+    });
+    await projectFromGit({ repository: this.#repository, projection: this.#projection });
+    for (const candidate of snapshot.records.filter((item) => item.frontmatter.kind === 'skill' &&
+      item.frontmatter.status === 'candidate' && item.frontmatter.skill?.related_strategy_ids.includes(suite.strategy_id))) {
+      this.#queueCandidateEvaluation(candidate.frontmatter.id);
+    }
+    return { commitSha: committed.commitSha, version: suite.version };
+  }
+
+  #queueCandidateEvaluation(skillId: string): void {
+    if (this.#jobs.list({ kind: 'skill_evaluate', limit: 1000 }).some((job) =>
+      (job.status === 'queued' || job.status === 'running') && job.payload['skillId'] === skillId)) return;
+    this.#jobs.create({ kind: 'skill_evaluate', trigger: 'post_ingest', priority: JOB_PRIORITY.post_ingest, payload: { skillId } });
+  }
+
+  /** 候选和基线在完全相同的隔离任务输入上运行，报告写入 Git。 */
+  async evaluate(input: { skillId: string }): Promise<EvaluationReport> {
+    const snapshot = await this.#repository.snapshot();
+    const candidate = snapshot.byId.get(input.skillId);
+    if (!candidate || candidate.frontmatter.kind !== 'skill' || candidate.frontmatter.status !== 'candidate' || !candidate.frontmatter.skill) {
+      throw new AquariusError('not_found', 'Skill candidate does not exist.');
+    }
+    const strategyId = candidate.frontmatter.skill.related_strategy_ids[0];
+    const suite = snapshot.evaluationSuites.find((item) => item.strategy_id === strategyId);
+    if (!suite) throw new AquariusError('validation_failed', 'No independent evaluation suite is registered.', {
+      actionable: 'Register a release-checklist evaluation suite before running the candidate evaluation.',
+    });
+    if (suite.cases.some((item) => item.source_case_id && candidate.frontmatter.supporting_case_ids.includes(item.source_case_id))) {
+      throw new AquariusError('validation_failed', 'Evaluation cases overlap candidate synthesis cases.');
+    }
+    const baselineId = candidate.frontmatter.revises_skill_id ?? null;
+    const baseline = baselineId ? snapshot.byId.get(baselineId) : null;
+    if (baselineId && (!baseline || baseline.frontmatter.status !== 'active')) {
+      throw new AquariusError('validation_failed', 'Revision baseline is no longer active.');
+    }
+    const candidateText = await this.#store.readFile(candidate.path);
+    const baselineText = baseline ? await this.#store.readFile(baseline.path) : null;
+    if (!candidateText || (baseline && !baselineText)) throw new AquariusError('validation_failed', 'Evaluation source file is missing at HEAD.');
+    if (this.#redactor.redact(candidateText).redacted || (baselineText && this.#redactor.redact(baselineText).redacted)) {
+      throw new AquariusError('validation_failed', 'Evaluation source contains credential-shaped content and cannot be sent to a model.', {
+        actionable: 'Remove the credential-shaped content from the Skill before evaluating it.',
+      });
+    }
+    const results: EvaluationReport['cases'] = [];
+    let failedRun = false;
+    for (const fixture of suite.cases) {
+      try {
+        const baselineTrial = await this.#runtime.evaluateSkill({ task: fixture, skillText: baselineText });
+        const candidateTrial = await this.#runtime.evaluateSkill({ task: fixture, skillText: candidateText });
+        results.push({
+          id: fixture.id,
+          baseline: baselineTrial,
+          candidate: candidateTrial,
+          baseline_pass: passesEvaluationCase(fixture, baselineTrial),
+          candidate_pass: passesEvaluationCase(fixture, candidateTrial),
+          critical: fixture.critical,
+        });
+      } catch {
+        failedRun = true;
+        break;
+      }
+    }
+    const now = nowIso();
+    const report = evaluationReportSchema.parse({
+      report_id: deriveId('eval', input.skillId, now, randomUUID()),
+      candidate_id: input.skillId,
+      candidate_hash: sha256(candidateText),
+      baseline_skill_id: baselineId,
+      baseline_commit_sha: candidate.frontmatter.base_commit_sha ?? null,
+      baseline_hash: baselineText ? sha256(baselineText) : null,
+      suite_hash: sha256(JSON.stringify(suite)),
+      suite_version: suite.version,
+      model: this.#runtime.model,
+      runtime: this.#runtime.mode,
+      contract: suite.contract,
+      scope: 'controlled-tool-simulation; no real commands',
+      budget: {
+        max_turns: this.#config.budgets.maxTurns,
+        max_output_tokens: this.#config.budgets.maxOutputTokens,
+        run_timeout_ms: this.#config.budgets.runTimeoutMs,
+      },
+      status: failedRun ? 'insufficient_evidence' : judgeEvaluation(results, this.#runtime.mode),
+      cases: results,
+      created_at: now,
+    });
+    await this.#store.commit([{ path: evaluationReportPath(report.report_id), content: `${JSON.stringify(report, null, 2)}\n` }], {
+      expectedHead: snapshot.head,
+      subject: `Evaluate skill candidate ${input.skillId}`,
+      trailers: { kind: 'skill-evaluation' },
+    });
+    await projectFromGit({ repository: this.#repository, projection: this.#projection });
+    return report;
+  }
+
+  #evaluationState(snapshot: Awaited<ReturnType<MemoryRepository['snapshot']>>, candidate: MemoryRecord): SkillCandidateView['evaluation'] {
+    const reports = snapshot.evaluationReports
+      .filter((item) => item.candidate_id === candidate.frontmatter.id)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+    const report = reports[0];
+    if (!report) return { status: 'missing', reportId: null, scope: null };
+    const suite = snapshot.evaluationSuites.find((item) => item.strategy_id === candidate.frontmatter.skill?.related_strategy_ids[0]);
+    const baselineId = candidate.frontmatter.revises_skill_id ?? null;
+    const baseline = baselineId ? snapshot.byId.get(baselineId) : null;
+    const casesMatch = Boolean(suite) && report.cases.length === suite!.cases.length &&
+      report.cases.every((item, index) => {
+        const fixture = suite!.cases[index]!;
+        return item.id === fixture.id && item.critical === fixture.critical &&
+          item.candidate_pass === passesEvaluationCase(fixture, item.candidate) &&
+          item.baseline_pass === passesEvaluationCase(fixture, item.baseline);
+      });
+    const stale = !suite || report.candidate_hash !== snapshot.fileHashes.get(candidate.path) ||
+      report.suite_hash !== sha256(JSON.stringify(suite)) || report.baseline_skill_id !== baselineId ||
+      report.baseline_commit_sha !== (candidate.frontmatter.base_commit_sha ?? null) ||
+      report.baseline_hash !== (baseline ? snapshot.fileHashes.get(baseline.path) : null) ||
+      (baseline && candidate.frontmatter.base_content_hash !== snapshot.fileHashes.get(baseline.path)) ||
+      report.model !== this.#runtime.model || report.runtime !== this.#runtime.mode ||
+      report.budget.max_turns !== this.#config.budgets.maxTurns ||
+      report.budget.max_output_tokens !== this.#config.budgets.maxOutputTokens ||
+      report.budget.run_timeout_ms !== this.#config.budgets.runTimeoutMs ||
+      !casesMatch || report.status !== judgeEvaluation(report.cases, report.runtime) ||
+      suite.cases.some((item) => item.source_case_id && candidate.frontmatter.supporting_case_ids.includes(item.source_case_id));
+    return { status: stale ? 'stale' : report.runtime === 'fake' ? 'insufficient_evidence' : report.status, reportId: report.report_id, scope: report.scope };
   }
 
   async reject(input: { skillId: string; reason: string; resolvedBy: string; expectedHead: string | null }): Promise<{ commitSha: string }> {
@@ -656,20 +949,21 @@ export class SkillService {
       });
     }
 
+    const version = publication.version + 1;
     const restored: MemoryRecord = {
       ...parsed.value,
-      frontmatter: { ...parsed.value.frontmatter, status: 'active', updated_at: nowIso() },
+      frontmatter: { ...parsed.value.frontmatter, status: 'active', skill_version: version, updated_at: nowIso() },
     };
     const result = await this.#store.commit(
       [{ path: skillPath(input.skillId, 'active'), content: serializeRecord(restored) }],
       {
         expectedHead: currentHead,
-        subject: `Roll back skill ${publication.skillName} to v${publication.version - 1}`,
-        body: [`Requested by: ${input.requestedBy}`, `Rolled back from: ${publication.commitSha ?? 'unknown'}`].join('\n'),
+        subject: `Roll back skill ${publication.skillName} as v${version}`,
+        body: [`Requested by: ${input.requestedBy}`, `Rolled back from: ${publication.commitSha ?? 'unknown'}`, `Restored source: ${publication.previousCommitSha}`].join('\n'),
         trailers: { kind: 'skill-rollback' },
       },
     );
-    const version = publication.version;
+    await projectFromGit({ repository: this.#repository, projection: this.#projection });
     const install = await this.#install({
       skillId: input.skillId,
       name: publication.skillName,
@@ -722,7 +1016,7 @@ export class SkillService {
     const directory = join(this.#config.skillInstallDir, record.frontmatter.skill.name);
     const publication = this.#projection.getSkillPublication(input.skillId);
     let removedDirectory: string | null = null;
-    if (await this.#isManagedInstall(directory)) {
+    if (await this.#isManagedInstall(directory) && await this.#installedOwner(directory) === input.skillId) {
       await rm(directory, { recursive: true, force: true });
       removedDirectory = directory;
     }
@@ -771,11 +1065,11 @@ export class SkillService {
     const previousPublication = this.#projection.getSkillPublication(input.skillId);
     if (await exists(directory)) {
       const managed = await this.#isManagedInstall(directory);
-      if (!managed) {
+      if (!managed || await this.#installedOwner(directory) !== input.skillId) {
         throw new AquariusError(
           'skill_install_conflict',
-          `Refusing to install over ${directory}: it exists but is not managed by Aquarius.`,
-          { actionable: 'Move or rename the existing skill directory, then retry.' },
+          `Refusing to install over ${directory}: it is not owned by this Aquarius Skill.`,
+          { actionable: 'Move or rename the conflicting skill directory, then retry.' },
         );
       }
     }
@@ -816,11 +1110,20 @@ export class SkillService {
     }
   }
 
+  async #installedOwner(directory: string): Promise<string | null> {
+    try {
+      const content = await readFile(join(directory, 'SKILL.md'), 'utf8');
+      return content.match(/^aquarius_skill_id: (.+)$/m)?.[1]?.trim() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Detects a name collision in the install directory, and whether it is ours. */
-  async findInstalledConflict(name: string): Promise<{ path: string; managed: boolean } | null> {
+  async findInstalledConflict(name: string): Promise<{ path: string; managed: boolean; ownerId: string | null } | null> {
     const directory = join(this.#config.skillInstallDir, name);
     if (!(await exists(directory))) return null;
-    return { path: join(directory, 'SKILL.md'), managed: await this.#isManagedInstall(directory) };
+    return { path: join(directory, 'SKILL.md'), managed: await this.#isManagedInstall(directory), ownerId: await this.#installedOwner(directory) };
   }
 
   /** Lists everything in the Codex skills directory so `doctor` can report on it. */

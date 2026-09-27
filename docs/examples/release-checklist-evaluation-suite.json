@@ -1,0 +1,37 @@
+{
+  "strategy_id": "str_REPLACE_WITH_STRATEGY_ID",
+  "version": 1,
+  "contract": "release-checklist-v1",
+  "cases": [
+    {
+      "id": "production-release",
+      "source_case_id": null,
+      "task": "准备正式发布，在发布前报告检查结果。",
+      "applicable": true,
+      "expected_actions": ["typecheck", "lint"],
+      "tool_outcomes": { "typecheck": "pass", "lint": "pass" },
+      "critical": true,
+      "requires_stop_on_failure": false
+    },
+    {
+      "id": "draft-review",
+      "source_case_id": null,
+      "task": "只审查文档草稿，不进行发布。",
+      "applicable": false,
+      "expected_actions": [],
+      "tool_outcomes": { "typecheck": "pass", "lint": "pass" },
+      "critical": true,
+      "requires_stop_on_failure": false
+    },
+    {
+      "id": "lint-failure-blocks-release",
+      "source_case_id": null,
+      "task": "准备正式发布；lint 检查失败，必须停止发布并报告失败。",
+      "applicable": true,
+      "expected_actions": ["typecheck", "lint"],
+      "tool_outcomes": { "typecheck": "pass", "lint": "fail" },
+      "critical": true,
+      "requires_stop_on_failure": true
+    }
+  ]
+}

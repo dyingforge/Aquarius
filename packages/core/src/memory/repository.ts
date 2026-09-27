@@ -5,6 +5,8 @@ import { memoryPath, SUMMARY_FILES } from './paths.ts';
 import { sha256 } from '../util/fsx.ts';
 import { createLogger } from '../util/logger.ts';
 import { DEFAULT_TIME_ZONE } from '../util/time.ts';
+import { caseOutcomeSchema, type CaseOutcome } from '../gates/caseOutcome.ts';
+import { evaluationReportSchema, evaluationSuiteSchema, type EvaluationReport, type EvaluationSuite } from '../skills/evaluation.ts';
 
 const log = createLogger('memory:repository');
 
@@ -20,8 +22,12 @@ export interface MemorySnapshot {
   byId: Map<string, MemoryRecord>;
   evidence: StoredEvidenceFile[];
   evidenceByCase: Map<string, StoredEvidenceFile[]>;
+  outcomes: CaseOutcome[];
+  evaluationSuites: EvaluationSuite[];
+  evaluationReports: EvaluationReport[];
   parseErrors: string[];
   files: string[];
+  fileHashes: Map<string, string>;
 }
 
 /**
@@ -53,13 +59,48 @@ export class MemoryRepository {
     const records: MemoryRecord[] = [];
     const evidence: StoredEvidenceFile[] = [];
     const evidenceByCase = new Map<string, StoredEvidenceFile[]>();
+    const outcomes: CaseOutcome[] = [];
+    const evaluationSuites: EvaluationSuite[] = [];
+    const evaluationReports: EvaluationReport[] = [];
     const parseErrors: string[] = [];
+    const fileHashes = new Map<string, string>();
 
     for (const file of files) {
+      if (file.startsWith('evaluations/') && file.endsWith('.json')) {
+        const content = await this.#store.readFile(file, resolvedHead ?? undefined);
+        if (content !== null) fileHashes.set(file, sha256(content));
+        try {
+          if (file.startsWith('evaluations/suites/')) {
+            const parsed = evaluationSuiteSchema.parse(JSON.parse(content ?? 'null'));
+            if (file !== `evaluations/suites/${parsed.strategy_id}.json`) throw new Error('path does not match strategy ID');
+            evaluationSuites.push(parsed);
+          } else if (file.startsWith('evaluations/reports/')) {
+            const parsed = evaluationReportSchema.parse(JSON.parse(content ?? 'null'));
+            if (file !== `evaluations/reports/${parsed.report_id}.json`) throw new Error('path does not match report ID');
+            evaluationReports.push(parsed);
+          } else throw new Error('unknown evaluation file');
+        } catch (error) {
+          parseErrors.push(`${file}: invalid evaluation (${(error as Error).message})`);
+        }
+        continue;
+      }
+      if (file.startsWith('outcomes/') && file.endsWith('.json')) {
+        const content = await this.#store.readFile(file, resolvedHead ?? undefined);
+        if (content !== null) fileHashes.set(file, sha256(content));
+        try {
+          const parsed = caseOutcomeSchema.parse(JSON.parse(content ?? 'null'));
+          if (file !== `outcomes/${parsed.case_id}/${parsed.outcome_id}.json`) throw new Error('path does not match outcome IDs');
+          outcomes.push(parsed);
+        } catch (error) {
+          parseErrors.push(`${file}: invalid case outcome (${(error as Error).message})`);
+        }
+        continue;
+      }
       if (!file.endsWith('.md')) continue;
       if (file.startsWith('summary/') || file.startsWith('audit/') || file.startsWith('reviews/')) continue;
       const content = await this.#store.readFile(file, resolvedHead ?? undefined);
       if (content === null) continue;
+      fileHashes.set(file, sha256(content));
 
       if (file.startsWith('evidence/')) {
         const parsed = tryParseEvidence(content, file);
@@ -95,7 +136,7 @@ export class MemoryRepository {
     const byId = new Map<string, MemoryRecord>();
     for (const record of records) byId.set(record.frontmatter.id, record);
 
-    return { head: resolvedHead, records, byId, evidence, evidenceByCase, parseErrors, files };
+    return { head: resolvedHead, records, byId, evidence, evidenceByCase, outcomes, evaluationSuites, evaluationReports, parseErrors, files, fileHashes };
   }
 
   async activeRecords(head?: string | null): Promise<MemoryRecord[]> {

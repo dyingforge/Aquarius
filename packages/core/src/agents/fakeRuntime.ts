@@ -5,6 +5,7 @@ import type {
   AnswerInput,
   ConsolidateInput,
   ExtractInput,
+  EvaluateSkillInput,
   SelectInput,
   SynthesizeSkillInput,
 } from './runtime.ts';
@@ -19,6 +20,7 @@ import type {
 import { lexicalOverlap, tokenizeForFts } from '../query/ftsText.ts';
 import { deriveId } from '../util/ids.ts';
 import { looksContradictory } from './contradiction.ts';
+import type { SkillTrial } from '../skills/evaluation.ts';
 
 /**
  * Deterministic agent double.
@@ -112,6 +114,7 @@ export class FakeAgentRuntime implements AgentRuntime {
         memory_consolidator: [],
         memory_query: ['read_memory', 'read_evidence'],
         skill_synthesizer: [],
+        skill_evaluator: ['run_typecheck', 'run_lint'],
       },
     };
   }
@@ -363,6 +366,7 @@ export class FakeAgentRuntime implements AgentRuntime {
       steps: [
         `Confirm the task matches the trigger: ${clip(input.strategy.title, 120)}.`,
         clip(input.strategy.body, 400),
+        ...(input.cases.some((item) => item.outcome === 'failure') ? ['If a required check fails, stop and report the failing check before release.'] : []),
         'Verify the outcome before reporting it, and state any assumption that was needed.',
       ],
       limitations: [
@@ -379,6 +383,18 @@ export class FakeAgentRuntime implements AgentRuntime {
         ),
       ].sort(),
       rationale: `Synthesized from ${input.cases.length} independent cases. Evidence: ${evidenceSnippets.join(' | ') || 'none provided'}`,
+    };
+  }
+
+  async evaluateSkill(input: EvaluateSkillInput): Promise<SkillTrial> {
+    const applicable = /release|发布/i.test(input.task.task) && !/draft|草稿|不要发布/i.test(input.task.task);
+    const useSkill = Boolean(input.skillText && applicable && /typecheck/i.test(input.skillText) && /lint/i.test(input.skillText));
+    const actions: SkillTrial['actions'] = useSkill ? ['typecheck', 'lint'] : [];
+    return {
+      use_skill: useSkill,
+      actions,
+      reported_failure: useSkill && actions.some((action) => input.task.tool_outcomes[action] === 'fail'),
+      stops_on_failure: Boolean(useSkill && input.skillText && /stop and report/i.test(input.skillText)),
     };
   }
 }

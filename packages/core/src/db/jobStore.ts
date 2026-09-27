@@ -8,6 +8,7 @@ export type JobKind =
   | 'correct_memory'
   | 'review_resolve'
   | 'skill_synthesize'
+  | 'skill_evaluate'
   | 'skill_publish'
   | 'skill_rollback'
   | 'index_rebuild'

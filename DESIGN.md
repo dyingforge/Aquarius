@@ -21,7 +21,7 @@ Aquarius 不做「永久思考」的 Agent。每一次消化和每一次问答�
 模型输出永远是「建议」。谁能进入当前视图由 `gates/` 的纯函数判定，输入是结构化观测 + 证据 + case 计数，输出是 `active | candidate | review | reject`。
 
 推论：
-- 模型可以把推断标成 `user_explicit`，但 `verifyAuthority()` 会按被引用的证据重新计算权威等级——没有用户原话就是推断。
+- 模型可以把推断标成 `user_explicit`，但 `verifyAuthority()` 会按被引用的证据重新计算权威等级；用户消息还须原样支持待写入的主张，否则降级。
 - 冲突判定不依赖模型分类，摄取流水线里有一道独立的极性检查（`agents/contradiction.ts`）。
 - 想调整记忆策略，改代码和测试，不要改提示词。
 
@@ -30,7 +30,7 @@ Aquarius 不做「永久思考」的 Agent。每一次消化和每一次问答�
 记忆的正文、状态、有效期、来源全部在 Git 里（Markdown + YAML frontmatter）。SQLite 只保存两类东西：运行状态（任务、游标、审批、安装记录）与**可重建投影**（FTS 索引、摘要、发布记录）。
 
 推论：
-- 删除 `aquarius.db` 不会丢任何记忆；`aquarius index rebuild` 后检索集合完全一致（有测试断言「重建前后可检索集合相同」）。
+- 删除 `aquarius.db` 不会丢任何记忆、任务结果或 Skill 评测报告；`aquarius index rebuild` 后可从 Git 恢复结果投影、检索集合和已发布 Skill 版本。安装文件本身也可与 Git 对账。
 - 反向不成立：只靠 SQLite 无法恢复 canonical memory。所以写入顺序永远是 Git 先、SQLite 后，中间崩溃由启动对账修复（见 I4）。
 
 ### I3：所有写入经同一队列，且基于明确的 HEAD
@@ -68,6 +68,8 @@ Aquarius 不做「永久思考」的 Agent。每一次消化和每一次问答�
 
 「独立 case」= 不同根线程。同一根线程的续聊只算一个 case；模型自己的历史回答永远不算证据（它根本不进入证据集）。
 
+Skill 所需的「成功」由用户针对 `case_id + strategy_id + attempt_id` 显式确认，连同证据 ID 写入 `outcomes/`。普通用户指令与单次成功工具返回都不能冒充任务成功；修正以新结果指向旧结果，未消解的矛盾按 `unknown` 处理。旧案例默认无成功结果。
+
 ### 3.2 状态流转
 
 ```text
@@ -91,6 +93,8 @@ active/    当前为真的记忆                             ← 问答可读
 candidates/ 未晋升 / 待审候选                         ← 问答不可读
 archive/   已移出视图的记忆                           ← 问答不可读
 evidence/  脱敏证据片段
+outcomes/  策略尝试的显式任务结果
+evaluations/  固定评测集与可审计报告
 reviews/   审查决定的可审计留痕
 skills/    candidates / published / retired
 audit/     每次摄取的运行记录（不含原文与凭据）
@@ -116,16 +120,17 @@ audit/     每次摄取的运行记录（不含原文与凭据）
 ## 5. Skill 生命周期
 
 ```text
-candidate → approved → published → installed
+candidate → evaluation pass → approved → published → installed
          ↘ rejected
-published → retired / rollback
+published → revision candidate → evaluation pass → approved v2
+published → retired / rollback（回滚形成新版本）
 ```
 
 - 候选可以自动生成；**发布永远需要用户明确批准**——代码里不存在从摄取任务直达发布的路径。
-- 发布门禁是**静态**的：格式、必填输入输出、来源 case、敏感信息、安装冲突、绝对路径、未声明工具依赖、可执行代码。**不做**语义质量评测，也不强制试运行（这是刻意的产品决定，见 PLAN §8）。
+- 发布先过静态门禁，再过 Git 中的版本化质量报告；候选内容、基线内容、评测集或模型变化均使报告过期。评测用独立任务集和受控工具替身比较候选与基线：关键场景须全部通过、不适用任务不得误触发、不能回退、至少修复一处基线失败。真实命令与真实工作区不交给评测 Agent；报告明确写明「受控工具模拟，不代表真实任务端到端通过」。`fake` 运行时只能验证流程，报告不能放行发布。
 - 先提交到 Git 的 `published/` 区域，再由确定性安装器投影到 Codex skills 目录；安装文件带 `aquarius_managed: true` 标记。
-- 安装器**绝不覆盖非 Aquarius 管理的同名 Skill**：冲突时停止并返回可处理的错误。
-- 回滚从历史 commit 读回上一版内容，重新安装；SQLite 记录 published commit、安装路径与文件哈希。
+- 安装器只覆盖**同一 Skill ID** 拥有的受管安装；其他受管 Skill 或外部同名目录均拒绝覆盖。
+- 修订候选有新的 candidate ID、稳定的目标 Skill ID 以及基线 commit/内容哈希。批准时在一次提交中删除候选并更新原发布路径；旧版在批准前保持安装。回滚从历史 commit 读回上一版内容，生成单调递增的新版本并重新安装。
 
 ## 6. 关键取舍（以及放弃了什么）
 

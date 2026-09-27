@@ -27,6 +27,7 @@ import { FakeAgentRuntime } from './agents/fakeRuntime.ts';
 import { OpenAIAgentRuntime } from './agents/openaiRuntime.ts';
 import { IngestService } from './pipeline/ingest.ts';
 import { RetrievalService, type QueryResponse, type IndexRebuildReport } from './query/retrieval.ts';
+import { projectFromGit } from './query/retrieval.ts';
 import { CorrectionService, type CorrectionConfirmation, type CorrectionPreview } from './corrections/service.ts';
 import { ReviewService, type ReviewDecision, type ReviewResolution } from './reviews/service.ts';
 import { SkillService } from './skills/service.ts';
@@ -35,6 +36,11 @@ import { Scheduler, type ScheduleDecision } from './jobs/scheduler.ts';
 import { reconcileFromGit, type ReconcileReport } from './jobs/reconcile.ts';
 import { isQueryReadablePath } from './memory/paths.ts';
 import { gitVersion } from './git/git.ts';
+import { caseOutcomeSchema, type CaseOutcome } from './gates/caseOutcome.ts';
+import { outcomePath } from './memory/paths.ts';
+import { deriveId } from './util/ids.ts';
+import { nowIso } from './util/time.ts';
+import type { EvaluationSuite, EvaluationReport } from './skills/evaluation.ts';
 
 const log = createLogger('service');
 
@@ -277,6 +283,7 @@ export class AquariusService {
       jobs: this.jobs,
       projection: this.projection,
     });
+    await this.skills.rebuildPublicationProjection();
     const schedule = this.scheduler.catchUpIfMissed();
     const skillState = await this.skills.verifyInstallations();
     for (const entry of skillState) {
@@ -496,6 +503,14 @@ export class AquariusService {
     return this.mutex.runExclusive(() => this.skills.approve(input));
   }
 
+  async setSkillEvaluationSuite(input: { suite: EvaluationSuite; expectedHead: string | null }): Promise<{ commitSha: string; version: number }> {
+    return this.mutex.runExclusive(() => this.skills.setEvaluationSuite(input));
+  }
+
+  async evaluateSkill(input: { skillId: string }): Promise<EvaluationReport> {
+    return this.skills.evaluate(input);
+  }
+
   async rejectSkill(input: {
     skillId: string;
     reason: string;
@@ -538,8 +553,88 @@ export class AquariusService {
     });
   }
 
+  /** 用户显式确认一次策略尝试的结果；Git 记录可由索引重建。 */
+  async recordCaseOutcome(input: {
+    caseId: string;
+    strategyId: string;
+    attemptId: string;
+    result: 'success' | 'failure' | 'unknown';
+    evidenceIds: string[];
+    expectedHead: string | null;
+    recordedBy: string;
+    supersedes?: string | null;
+  }): Promise<{ outcome: CaseOutcome; commitSha: string }> {
+    return this.mutex.runExclusive(async () => {
+      if (!input.attemptId || !input.recordedBy || !['success', 'failure', 'unknown'].includes(input.result) ||
+        !Array.isArray(input.evidenceIds) || input.evidenceIds.some((id) => typeof id !== 'string')) {
+        throw new AquariusError('validation_failed', 'A task outcome requires an attempt ID, result, recorder and evidence IDs.');
+      }
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(input.attemptId) || !/^[A-Za-z0-9_-]{1,120}$/.test(input.recordedBy) ||
+        this.redactor.redact(`${input.attemptId}\n${input.recordedBy}`).redacted) {
+        throw new AquariusError('validation_failed', 'Attempt ID and recorder must be safe identifiers without credential-shaped content.');
+      }
+      const snapshot = await this.repository.snapshot();
+      if (snapshot.head !== input.expectedHead) {
+        throw new AquariusError('stale_head', 'Case outcome confirmation requires the current HEAD.', {
+          actionable: 'Refresh the case and submit the result against the current HEAD.',
+        });
+      }
+      const strategy = snapshot.byId.get(input.strategyId);
+      if (!strategy || strategy.frontmatter.kind !== 'strategy' || !strategy.frontmatter.supporting_case_ids.includes(input.caseId)) {
+        throw new AquariusError('validation_failed', 'The strategy does not cite this case.', {
+          actionable: 'Select a case that supports the strategy.',
+        });
+      }
+      const evidence = snapshot.evidenceByCase.get(input.caseId) ?? [];
+      if (input.evidenceIds.length === 0 || input.evidenceIds.some((id) => !evidence.some((item) => item.frontmatter.evidence_id === id))) {
+        throw new AquariusError('validation_failed', 'Outcome evidence must exist in this case at Git HEAD.', {
+          actionable: 'Choose cited evidence IDs from the case, then confirm the task result.',
+        });
+      }
+      const superseded = input.supersedes
+        ? snapshot.outcomes.find((item) => item.outcome_id === input.supersedes)
+        : null;
+      if (input.supersedes && (!superseded || superseded.case_id !== input.caseId || superseded.strategy_id !== input.strategyId || superseded.attempt_id !== input.attemptId)) {
+        throw new AquariusError('validation_failed', 'The superseded outcome must belong to the same strategy attempt.');
+      }
+      const ids = [...new Set(input.evidenceIds)].sort();
+      const outcomeId = deriveId('out', input.caseId, input.strategyId, input.attemptId, input.result, ids.join(','), input.supersedes ?? '');
+      const existing = snapshot.outcomes.find((item) => item.outcome_id === outcomeId);
+      if (existing) return { outcome: existing, commitSha: snapshot.head! };
+      const checked = caseOutcomeSchema.safeParse({
+        outcome_id: outcomeId,
+        case_id: input.caseId,
+        strategy_id: input.strategyId,
+        attempt_id: input.attemptId,
+        result: input.result,
+        rule_id: 'user-confirmed-task-result-v1',
+        evidence_ids: ids,
+        source_event_ids: [...new Set(evidence.filter((item) => ids.includes(item.frontmatter.evidence_id))
+          .map((item) => item.frontmatter.event_id).filter((id): id is string => Boolean(id)))],
+        task_features: this.sessions.getCase(input.caseId)?.taskFeatures ?? [],
+        recorded_by: input.recordedBy,
+        recorded_at: nowIso(),
+        supersedes: input.supersedes ?? null,
+      });
+      if (!checked.success) throw new AquariusError('validation_failed', `Invalid task outcome: ${checked.error.issues.map((item) => item.message).join('; ')}`);
+      const outcome = checked.data;
+      const committed = await this.store.commit([{ path: outcomePath(input.caseId, outcomeId), content: `${JSON.stringify(outcome, null, 2)}\n` }], {
+        expectedHead: snapshot.head,
+        subject: `Record ${input.result} for strategy attempt`,
+        trailers: { kind: 'case-outcome' },
+      });
+      await projectFromGit({ repository: this.repository, projection: this.projection });
+      await this.skills.evaluateCandidates([input.strategyId]);
+      return { outcome, commitSha: committed.commitSha };
+    });
+  }
+
   async rebuildIndex(): Promise<IndexRebuildReport> {
-    return this.mutex.runExclusive(() => this.retrieval.rebuildIndex());
+    return this.mutex.runExclusive(async () => {
+      const report = await this.retrieval.rebuildIndex();
+      await this.skills.rebuildPublicationProjection();
+      return report;
+    });
   }
 
   // --- operations ------------------------------------------------------------
@@ -627,11 +722,27 @@ export class AquariusService {
         if (typeof strategyMemoryId !== 'string') {
           throw new AquariusError('validation_failed', 'skill_synthesize job is missing strategyMemoryId.');
         }
+        if (await this.skills.hasCandidateFor(strategyMemoryId)) {
+          this.jobs.markSkipped(job.jobId, 'A candidate already exists for this strategy.');
+          return;
+        }
         await this.skills.generateCandidate(strategyMemoryId);
+        return;
+      }
+      case 'skill_evaluate': {
+        const skillId = job.payload['skillId'];
+        if (typeof skillId !== 'string') throw new AquariusError('validation_failed', 'skill_evaluate job is missing skillId.');
+        const candidate = (await this.repository.snapshot()).byId.get(skillId);
+        if (!candidate || candidate.frontmatter.status !== 'candidate') {
+          this.jobs.markSkipped(job.jobId, 'The candidate is no longer pending evaluation.');
+          return;
+        }
+        await this.skills.evaluate({ skillId });
         return;
       }
       case 'index_rebuild': {
         await this.retrieval.rebuildIndex();
+        await this.skills.rebuildPublicationProjection();
         return;
       }
       case 'reconcile': {
@@ -642,6 +753,7 @@ export class AquariusService {
           jobs: this.jobs,
           projection: this.projection,
         });
+        await this.skills.rebuildPublicationProjection();
         return;
       }
       default: {

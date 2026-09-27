@@ -193,7 +193,45 @@ export function buildApp(options: AppOptions): FastifyInstance {
     });
   });
 
-  app.get('/v1/skills', async () => ({ skills: service.skills.list() }));
+  app.get('/v1/skills', async () => ({ skills: await service.skills.list() }));
+
+  app.post('/v1/skills/evaluation-suites', async (request) => {
+    const body = request.body as Record<string, unknown>;
+    return service.setSkillEvaluationSuite({ suite: readField<Parameters<typeof service.setSkillEvaluationSuite>[0]['suite']>(body, 'suite', true)!, expectedHead: expectedHeadFrom(body) });
+  });
+
+  app.post('/v1/skills/:skillId/evaluate', async (request) => {
+    const { skillId } = request.params as { skillId: string };
+    return service.evaluateSkill({ skillId });
+  });
+
+  app.get('/v1/skills/:skillId/evaluation', async (request) => {
+    const { skillId } = request.params as { skillId: string };
+    const snapshot = await service.repository.snapshot();
+    return { reports: snapshot.evaluationReports.filter((item) => item.candidate_id === skillId).sort((a, b) => b.created_at.localeCompare(a.created_at)) };
+  });
+
+  app.post('/v1/cases/:caseId/outcomes', async (request) => {
+    const { caseId } = request.params as { caseId: string };
+    const body = request.body as Record<string, unknown>;
+    const strategyId = readField<string>(body, 'strategyId');
+    const attemptId = readField<string>(body, 'attemptId');
+    const result = readField<string>(body, 'result');
+    const evidenceIds = readField<string[]>(body, 'evidenceIds');
+    if (!strategyId || !attemptId || !['success', 'failure', 'unknown'].includes(result ?? '') || !Array.isArray(evidenceIds)) {
+      throw new AquariusError('validation_failed', 'strategyId, attemptId, result and evidenceIds are required.');
+    }
+    return service.recordCaseOutcome({
+      caseId,
+      strategyId,
+      attemptId,
+      result: result as 'success' | 'failure' | 'unknown',
+      evidenceIds,
+      expectedHead: expectedHeadFrom(body),
+      recordedBy: readField<string>(body, 'recordedBy') ?? 'local-user',
+      supersedes: readField<string>(body, 'supersedes'),
+    });
+  });
 
   app.get('/v1/skills/:skillId', async (request) => {
     const { skillId } = request.params as { skillId: string };

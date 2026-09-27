@@ -61,6 +61,7 @@ export const skillSpecSchema = z.object({
   tool_dependencies: z.array(z.string().min(1)).max(24).default([]),
   related_strategy_ids: z.array(z.string().min(1)).default([]),
   related_case_ids: z.array(z.string().min(1)).default([]),
+  source_outcome_ids: z.array(z.string().min(4)).default([]),
 });
 export type SkillSpec = z.output<typeof skillSpecSchema>;
 
@@ -88,6 +89,10 @@ export const memoryFrontmatterSchema = z
     /** Non-empty means the record is quarantined for review and cannot be published. */
     review_flags: z.array(z.string().min(3)).default([]),
     skill: skillSpecSchema.optional(),
+    skill_version: z.number().int().positive().optional(),
+    revises_skill_id: z.string().min(4).optional(),
+    base_commit_sha: z.string().min(7).optional(),
+    base_content_hash: z.string().length(64).optional(),
     /** Search keywords the extractor wants indexed in addition to the body. */
     keywords: z.array(z.string().min(1).max(64)).max(32).default([]),
   })
@@ -104,6 +109,9 @@ export const memoryFrontmatterSchema = z
     }
     if (value.kind !== 'skill' && value.skill) {
       ctx.addIssue({ code: 'custom', path: ['skill'], message: 'the `skill` block is only valid for kind=skill' });
+    }
+    if (value.revises_skill_id && (value.kind !== 'skill' || value.status !== 'candidate' || !value.base_commit_sha || !value.base_content_hash)) {
+      ctx.addIssue({ code: 'custom', path: ['revises_skill_id'], message: 'a revision candidate requires a base commit and content hash' });
     }
     if (value.status === 'superseded' && !value.superseded_by) {
       ctx.addIssue({

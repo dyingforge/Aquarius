@@ -70,6 +70,8 @@ const ALLOWED_PREFIXES = [
   'candidates/',
   'archive/',
   'evidence/',
+  'outcomes/',
+  'evaluations/',
   'reviews/',
   'skills/',
   'audit/',
@@ -473,6 +475,7 @@ export class MemoryStore {
 
   /** Parent chain of a path, newest first. Used for skill rollback. */
   async fileHistory(path: string, limit = 20): Promise<string[]> {
+    assertSafeMemoryPath(path);
     const result = await runGit(['log', `--max-count=${limit}`, '--format=%H', '--', path], {
       cwd: this.repoPath,
       allowFailure: true,

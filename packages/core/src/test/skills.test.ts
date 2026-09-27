@@ -2,18 +2,38 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { createEnvironment, writeCodexSession, ageFile, type TestEnvironment } from './harness.ts';
+import { createEnvironment as makeEnvironment, writeCodexSession, ageFile, type TestEnvironment } from './harness.ts';
+import { FakeAgentRuntime } from '../agents/fakeRuntime.ts';
+import type { AgentRuntime } from '../agents/runtime.ts';
 import { AQUARIUS_SKILL_MARKER, validateSkillCandidate } from '../skills/service.ts';
 import { credentialLike } from './fixtures.ts';
 import { tryParseMemory } from '../memory/frontmatter.ts';
 import { serializeRecord } from '../memory/repository.ts';
 import { createRedactor } from '../security/redact.ts';
+import { effectiveCaseOutcome } from '../gates/caseOutcome.ts';
+
+/** 测试用的确定性替身，保留发布流程测试；真实质量结论仍须用真实运行时。 */
+function createEnvironment(): Promise<TestEnvironment> {
+  const fake = new FakeAgentRuntime();
+  const runtime: AgentRuntime = {
+    mode: 'openai',
+    model: 'test-evaluator-stub',
+    describe: () => ({ ...fake.describe(), mode: 'openai', model: 'test-evaluator-stub' }),
+    extract: (input) => fake.extract(input),
+    consolidate: (input) => fake.consolidate(input),
+    selectRelevant: (input) => fake.selectRelevant(input),
+    answer: (input) => fake.answer(input),
+    synthesizeSkill: (input) => fake.synthesizeSkill(input),
+    evaluateSkill: (input) => fake.evaluateSkill(input),
+  };
+  return makeEnvironment({ runtime, scheduleEnabled: false });
+}
 
 /**
  * Builds three independent cases with two distinct task features that all support
  * the same strategy, which is the documented precondition for a skill candidate.
  */
-async function buildSkillEvidence(env: TestEnvironment): Promise<void> {
+async function buildSkillEvidence(env: TestEnvironment, confirmOutcomes = true): Promise<void> {
   const sessions: [string, string, { name: string; output: string }][] = [
     ['01a00000-0000-7000-8000-000000000601', '以后每次发布前都先跑完整的 typecheck 和 lint 检查', { name: 'exec', output: 'Script completed\nnpm run typecheck && npm run lint' }],
     ['01a00000-0000-7000-8000-000000000602', '以后每次发布前都先跑完整的 typecheck 和 lint 检查', { name: 'exec', output: 'Script completed\nnpm run typecheck && npm run lint' }],
@@ -30,10 +50,47 @@ async function buildSkillEvidence(env: TestEnvironment): Promise<void> {
   cases.forEach((caseRecord, index) => {
     env.service.sessions.setCaseTaskFeatures(caseRecord.caseId, features[index % features.length]!);
   });
+  if (confirmOutcomes) {
+    const snapshot = await env.service.repository.snapshot();
+    for (const strategy of snapshot.records.filter((record) => record.frontmatter.kind === 'strategy' && record.frontmatter.status === 'active')) {
+      for (const caseId of strategy.frontmatter.supporting_case_ids) {
+        const caseEvidence = snapshot.evidenceByCase.get(caseId) ?? [];
+        if (caseEvidence.length === 0) continue;
+        await env.service.recordCaseOutcome({
+          caseId,
+          strategyId: strategy.frontmatter.id,
+          attemptId: `release-${caseId}`,
+          result: 'success',
+          evidenceIds: [caseEvidence[0]!.frontmatter.evidence_id],
+          expectedHead: await env.service.store.head(),
+          recordedBy: 'tester',
+        });
+      }
+    }
+  }
   // Case features are what the skill gate measures diversity over, so evaluate
   // again once they are recorded.
   await env.service.evaluateSkillCandidates();
   await env.service.drainJobs(20);
+  if (confirmOutcomes) {
+    const snapshot = await env.service.repository.snapshot();
+    for (const strategy of snapshot.records.filter((record) => record.frontmatter.kind === 'strategy' && record.frontmatter.status === 'active')) {
+      await env.service.setSkillEvaluationSuite({
+        expectedHead: await env.service.store.head(),
+        suite: {
+          strategy_id: strategy.frontmatter.id,
+          version: 1,
+          contract: 'release-checklist-v1',
+          cases: [
+            { id: 'release-pass', source_case_id: null, task: 'Prepare a production release', applicable: true, expected_actions: ['typecheck', 'lint'], tool_outcomes: { typecheck: 'pass', lint: 'pass' }, critical: true, requires_stop_on_failure: false },
+            { id: 'draft-only', source_case_id: null, task: 'Review a draft without publishing', applicable: false, expected_actions: [], tool_outcomes: { typecheck: 'pass', lint: 'pass' }, critical: true, requires_stop_on_failure: false },
+            { id: 'release-lint-fail', source_case_id: null, task: 'Prepare a production release with failing lint', applicable: true, expected_actions: ['typecheck', 'lint'], tool_outcomes: { typecheck: 'pass', lint: 'fail' }, critical: true, requires_stop_on_failure: false },
+          ],
+        },
+      });
+    }
+    await env.service.drainJobs(20);
+  }
 }
 
 async function findSkillCandidate(env: TestEnvironment): Promise<string> {
@@ -113,7 +170,7 @@ test('a strategy with three independent successful cases produces an installable
 
     const queued = env.service.jobs.list({ kind: 'skill_synthesize', limit: 20 });
     assert.ok(queued.length >= 1, 'the skill gate should queue synthesis once the precondition holds');
-    assert.equal(queued[0]!.status, 'done');
+    assert.ok(queued.some((job) => job.status === 'done'));
 
     const skillId = await findSkillCandidate(env);
     const view = await env.service.skills.view(skillId);
@@ -160,6 +217,130 @@ test('two successful cases are not enough to trigger synthesis', async () => {
     assert.equal(skills.filter((skill) => skill.status === 'candidate').length, 0, 'two cases must not be enough');
     const jobs = env.service.jobs.list({ kind: 'skill_synthesize', limit: 10 });
     assert.equal(jobs.length, 0, 'no synthesis job should have been queued');
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('ordinary user instructions and successful tool calls do not prove task success', async () => {
+  const env = await createEnvironment();
+  try {
+    await buildSkillEvidence(env, false);
+    const candidates = (await env.service.skills.list()).filter((skill) => skill.status === 'candidate');
+    assert.equal(candidates.length, 0);
+    assert.equal(env.service.jobs.list({ kind: 'skill_synthesize', limit: 20 }).length, 0);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('a duplicate proposal under review does not reinforce an active strategy', async () => {
+  const fake = new FakeAgentRuntime();
+  let duplicateTarget: string | null = null;
+  const runtime: AgentRuntime = {
+    mode: 'fake', model: fake.model, describe: () => fake.describe(),
+    extract: async (input) => {
+      const result = await fake.extract(input);
+      return duplicateTarget ? { ...result, observations: result.observations.map((item) => ({ ...item, sensitivity: 'sensitive' as const })) } : result;
+    },
+    consolidate: async (input) => duplicateTarget ? {
+      operations: input.observations.map((item, index) => ({
+        operation: 'duplicate' as const, observation_index: index, target_memory_id: duplicateTarget,
+        reason: 'Same strategy', merged_title: null, merged_body: null, confidence: item.confidence,
+      })), notes: '',
+    } : fake.consolidate(input),
+    selectRelevant: (input) => fake.selectRelevant(input), answer: (input) => fake.answer(input),
+    synthesizeSkill: (input) => fake.synthesizeSkill(input), evaluateSkill: (input) => fake.evaluateSkill(input),
+  };
+  const env = await makeEnvironment({ runtime, scheduleEnabled: false });
+  try {
+    const message = '以后每次发布前都先跑完整的 typecheck 和 lint 检查';
+    const first = await writeCodexSession(env.root, { sessionId: '01a00000-0000-7000-8000-000000000691', userMessages: [message] });
+    await ageFile(first);
+    await env.service.ingest({});
+    const before = await env.service.repository.snapshot();
+    const strategy = before.records.find((item) => item.frontmatter.kind === 'strategy' && item.frontmatter.status === 'active')!;
+    duplicateTarget = strategy.frontmatter.id;
+    const second = await writeCodexSession(env.root, { sessionId: '01a00000-0000-7000-8000-000000000692', userMessages: [message] });
+    await ageFile(second);
+    await env.service.ingest({});
+    const after = await env.service.repository.snapshot();
+    assert.deepEqual(after.byId.get(strategy.frontmatter.id)?.frontmatter.supporting_case_ids, strategy.frontmatter.supporting_case_ids);
+    assert.ok(after.records.some((item) => item.frontmatter.kind === 'strategy' && item.frontmatter.status === 'candidate'));
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('case outcomes are idempotent, corrections are append-only, and the projection rebuilds from Git', async () => {
+  const env = await createEnvironment();
+  try {
+    await buildSkillEvidence(env, false);
+    const snapshot = await env.service.repository.snapshot();
+    const strategy = snapshot.records.find((item) => item.frontmatter.kind === 'strategy' && item.frontmatter.status === 'active')!;
+    const caseId = strategy.frontmatter.supporting_case_ids[0]!;
+    const evidenceId = snapshot.evidenceByCase.get(caseId)![0]!.frontmatter.evidence_id;
+    const input = { caseId, strategyId: strategy.frontmatter.id, attemptId: 'attempt-1', result: 'success' as const,
+      evidenceIds: [evidenceId], recordedBy: 'tester' };
+    const first = await env.service.recordCaseOutcome({ ...input, expectedHead: await env.service.store.head() });
+    const head = await env.service.store.head();
+    const repeated = await env.service.recordCaseOutcome({ ...input, expectedHead: head });
+    assert.equal(repeated.outcome.outcome_id, first.outcome.outcome_id);
+    assert.equal(await env.service.store.head(), head, 'repeat confirmation must not commit');
+    const correction = await env.service.recordCaseOutcome({
+      ...input, result: 'failure', supersedes: first.outcome.outcome_id,
+      expectedHead: await env.service.store.head(),
+    });
+    assert.notEqual(correction.outcome.outcome_id, first.outcome.outcome_id);
+    const updated = await env.service.repository.snapshot();
+    assert.equal(effectiveCaseOutcome(updated.outcomes, caseId, strategy.frontmatter.id), 'failure');
+    env.service.database.run('DELETE FROM case_outcomes');
+    await env.service.rebuildIndex();
+    assert.equal(env.service.projection.listCaseOutcomes(caseId).length, 2);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('a fake evaluation cannot authorize publication', async () => {
+  const env = await makeEnvironment({ scheduleEnabled: false });
+  try {
+    await buildSkillEvidence(env);
+    const skillId = await findSkillCandidate(env);
+    const view = await env.service.skills.view(skillId);
+    assert.equal(view.evaluation.status, 'insufficient_evidence');
+    await assert.rejects(
+      () => env.service.approveSkill({ skillId, expectedHead: env.service.projection.indexState().head, approvedBy: 'tester' }),
+      (error: { code?: string }) => error.code === 'validation_failed',
+    );
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('editing a candidate invalidates its previously passing evaluation report', async () => {
+  const env = await createEnvironment();
+  try {
+    await buildSkillEvidence(env);
+    const skillId = await findSkillCandidate(env);
+    assert.equal((await env.service.skills.view(skillId)).evaluation.status, 'pass');
+    const path = `skills/candidates/${skillId}.md`;
+    const original = await env.service.store.readFile(path);
+    const parsed = tryParseMemory(original!, path);
+    assert.ok(parsed.ok);
+    const changed = serializeRecord({
+      frontmatter: { ...parsed.value!.frontmatter, title: `${parsed.value!.frontmatter.title} updated` },
+      body: parsed.value!.body,
+    });
+    await env.service.store.commit([{ path, content: changed }], {
+      expectedHead: await env.service.store.head(), subject: 'Edit candidate for test', trailers: { kind: 'test' },
+    });
+    await env.service.rebuildIndex();
+    assert.equal((await env.service.skills.view(skillId)).evaluation.status, 'stale');
+    await assert.rejects(
+      () => env.service.approveSkill({ skillId, expectedHead: env.service.projection.indexState().head, approvedBy: 'tester' }),
+      (error: { code?: string }) => error.code === 'validation_failed',
+    );
   } finally {
     await env.cleanup();
   }
@@ -292,7 +473,7 @@ test('rejecting a candidate keeps it out of the published area', async () => {
   }
 });
 
-test('publishing a second version then rolling back restores the previous content', async () => {
+test('a failed attempt produces a reviewed revision; approval keeps the Skill ID and rollback creates v3', async () => {
   const env = await createEnvironment();
   try {
     await buildSkillEvidence(env);
@@ -301,33 +482,39 @@ test('publishing a second version then rolling back restores the previous conten
     const first = await env.service.approveSkill({ skillId, expectedHead: head, approvedBy: 'tester' });
     const firstContent = await readFile(first.installPath, 'utf8');
 
-    // Edit the candidate, re-publish: this is the "second version".
-    const live = `skills/published/${skillId}.md`;
-    const published = await env.service.store.readFile(live);
-    assert.ok(published);
-    const parsed = tryParseMemory(published!, live);
-    assert.equal(parsed.ok, true, JSON.stringify(parsed.errors));
-    const v2 = serializeRecord({
-      frontmatter: { ...parsed.value!.frontmatter, status: 'candidate', title: `${parsed.value!.frontmatter.title} v2` },
-      body: parsed.value!.body,
+    const view = await env.service.skills.view(skillId);
+    const strategyId = view.relatedStrategyIds[0]!;
+    const caseId = view.relatedCaseIds[0]!;
+    const snapshot = await env.service.repository.snapshot();
+    const prior = snapshot.outcomes.find((item) => item.strategy_id === strategyId && item.case_id === caseId)!;
+    const suite = snapshot.evaluationSuites.find((item) => item.strategy_id === strategyId)!;
+    await env.service.recordCaseOutcome({
+      caseId, strategyId, attemptId: prior.attempt_id, result: 'failure',
+      evidenceIds: prior.evidence_ids, supersedes: prior.outcome_id,
+      expectedHead: await env.service.store.head(), recordedBy: 'tester',
     });
-    await env.service.store.commit(
-      [
-        { path: live, content: null },
-        { path: `skills/candidates/${skillId}.md`, content: v2 },
-      ],
-      { expectedHead: await env.service.store.head(), subject: 'prepare v2', trailers: { kind: 'test' } },
-    );
-    await env.service.rebuildIndex();
-
-    const second = await env.service.approveSkill({
-      skillId,
+    await env.service.setSkillEvaluationSuite({
       expectedHead: await env.service.store.head(),
-      approvedBy: 'tester',
+      suite: { ...suite, version: 2, cases: [...suite.cases, {
+        id: 'release-stop-on-failure', source_case_id: null,
+        task: 'Prepare a production release and stop if lint fails', applicable: true,
+        expected_actions: ['typecheck', 'lint'], tool_outcomes: { typecheck: 'pass', lint: 'fail' },
+        critical: true, requires_stop_on_failure: true,
+      }] },
     });
+    await env.service.drainJobs(20);
+    const revisions = (await env.service.repository.snapshot()).records.filter((item) => item.frontmatter.revises_skill_id === skillId);
+    assert.equal(revisions.length, 1);
+    const candidateId = revisions[0]!.frontmatter.id;
+    assert.equal(await readFile(first.installPath, 'utf8'), firstContent, 'v1 stays installed until approval');
+    const report = await env.service.evaluateSkill({ skillId: candidateId });
+    assert.equal(report.status, 'pass');
+    const second = await env.service.approveSkill({ skillId: candidateId, expectedHead: await env.service.store.head(), approvedBy: 'tester' });
+    assert.equal(second.skillId, skillId);
     assert.equal(second.version, 2);
     const secondContent = await readFile(second.installPath, 'utf8');
     assert.notEqual(secondContent, firstContent);
+    assert.match(secondContent, /stop and report/i);
 
     const rollback = await env.service.rollbackSkill({
       skillId,
@@ -335,6 +522,7 @@ test('publishing a second version then rolling back restores the previous conten
       requestedBy: 'tester',
     });
     assert.ok(rollback.commitSha);
+    assert.equal(rollback.version, 3);
 
     const rolledBack = await readFile(rollback.installPath, 'utf8');
     assert.equal(
@@ -346,8 +534,11 @@ test('publishing a second version then rolling back restores the previous conten
     assert.equal(record?.status, 'installed');
     assert.ok(record?.rollbackOf, 'the rollback records what it rolled back from');
 
-    // Rolling back restored the original body, not the v2 edit.
-    assert.ok(!rolledBack.includes('(v2)'), 'rollback must restore the previous published content');
+    assert.ok(!rolledBack.includes('stop and report'), 'rollback restores the v1 behavior as a new version');
+    env.service.database.run('DELETE FROM skill_publications');
+    await env.service.rebuildIndex();
+    assert.equal(env.service.projection.getSkillPublication(skillId)?.version, 3);
+    assert.equal(env.service.projection.getSkillPublication(skillId)?.status, 'installed');
   } finally {
     await env.cleanup();
   }

@@ -69,7 +69,7 @@ docs/             # 设计、架构与流程文档
 
 - 经历：一次有效的用户陈述或可验证的工具结果即可写入当前视图。
 - 画像 / 策略：用户明确说出的直接生效；模型推断出来的必须有两个独立 case、高置信度且无未解决冲突。
-- Skill：同一策略在三个独立成功 case（且至少两种任务特征）之后才生成候选；**发布必须由你批准**。
+- Skill：同一策略在三个独立 case 的任务结果被你明确确认为成功（且至少两种任务特征）之后才生成候选；发布前须通过固定任务集的受控工具评测，**最后仍由你批准**。
 - 冲突、低置信、敏感内容一律进入 review 队列，不会自动污染当前记忆。
 
 ## 常用命令
@@ -81,7 +81,9 @@ aquarius memory list|show           查看记忆
 aquarius memory correct "<自然语言>" 预览 → 确认 → 提交修正
 aquarius ingest run|status          手动消化 / 查看调度与任务状态
 aquarius review list|show|resolve   审查冲突与候选（先看 diff 再决定）
-aquarius skill list|show|approve|reject|rollback|retire
+aquarius case-outcome <caseId> <strategyId> <attemptId> <success|failure|unknown> --evidence <ids>
+aquarius skill suite-set <jsonFile>
+aquarius skill list|show|evaluate|report|approve|reject|rollback|retire
 aquarius index rebuild              从 Git HEAD 重建检索索引
 ```
 

@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 存储位置 | `active/`、`candidates/`、`archive/` | `skills/candidates|published|retired/` |
 | 构建者 | 摄取流水线（Agent 提议 + 门禁判定）| SkillSynthesizerAgent（仅在门禁达标后）|
-| 校验 | frontmatter zod 契约 + 敏感信息 + 路径 | 契约 + **静态发布门禁**（见 §4）|
+| 校验 | frontmatter zod 契约 + 敏感信息 + 路径 | 契约 + 静态门禁 + 独立任务评测报告 |
 | 分发 | 无需分发：检索按状态读取 | 确定性安装器复制到 `~/.codex/skills/<name>/SKILL.md` |
 | 批准 | 晋升由确定性门禁决定；冲突/敏感由用户裁决 | **必须**用户明确批准 |
 | 回滚 | 修正/时间变化会关闭旧条目有效期 | 回滚到上一已发布版本并重装 |
@@ -55,11 +55,13 @@ session → 脱敏 → 提取观测 → 合并提议 → 门禁判定 → buildR
 ### 3.1 触发条件（全部满足才生成候选）
 
 1. 支撑策略状态为 `active`。
-2. ≥3 个独立 case 拥有成功证据（用户结果或可验证工具结果；Agent 自评不算）。
+2. ≥3 个独立 case 有针对该策略尝试的显式确认 `success` 结果；普通用户消息、单项工具成功和 Agent 自评都不算。
 3. ≥2 种不同任务特征。
-4. 该策略没有未解决冲突，且尚未存在候选/已发布 Skill。
+4. 该策略没有未解决冲突，且尚未存在未决候选。已有发布版仅在出现新结果或新支撑 case 时生成修订候选。
 
 不满足时不生成任何东西，只在任务统计里记录原因（`aquarius ingest status` 可见）。
+
+结果记录用 `aquarius case-outcome <caseId> <strategyId> <attemptId> <result> --evidence <ids>` 写入；须指定当前 `expectedHead`、该策略实际引用的 case、已存于 Git 的证据 ID。修正用 `--supersedes <outcomeId>` 追加记录；未解除的矛盾为 `unknown`。旧 case 不自动补成功。
 
 ### 3.2 候选构建
 
@@ -72,6 +74,8 @@ strategy + cases + 脱敏证据 → SkillSynthesizerAgent → skillDraftSchema
 ```
 
 候选内容恒为声明式：名称、用途、触发条件、输入、输出、步骤、限制、工具依赖、关联策略与案例、生成理由。**不含可执行代码。**
+
+修订候选另有 `revises_skill_id`、`base_commit_sha`、`base_content_hash`；候选 ID 与稳定发布 ID 分开。合成器接收发布版和新结果，名称固定为该发布版的安装名。
 
 ### 3.3 静态发布门禁
 
@@ -92,12 +96,20 @@ strategy + cases + 脱敏证据 → SkillSynthesizerAgent → skillDraftSchema
 
 有 flag = 隔离：写入候选项时 `review_flags` 非空，且 `approveSkill` 直接拒绝（`forbidden`），必须先解决异常审查。
 
+### 3.4 质量评测门禁
+
+维护者先用 `aquarius skill suite-set <jsonFile>` 登记版本化任务集；已有候选和随后生成的候选会排队评测，也可用 `aquarius skill evaluate <candidateId>` 手动重跑。首版只支持 `release-checklist-v1`：至少一个适用成功场景、一个不适用场景、一个工具失败场景。来源 case 不能与合成案例重叠；维护者要保证人工编写的合成任务也未泄漏给合成器。
+
+可从 [发布检查评测集样例](examples/release-checklist-evaluation-suite.json) 开始，替换策略 ID，并按真实任务的验收标准修改场景。样例中的 `source_case_id: null` 表示人工编写的合成任务，不自动证明它是独立保留集。
+
+候选与基线在相同任务、相同模型及预算下调用隔离的 `run_typecheck` / `run_lint` 替身，评测器记录**实际工具请求顺序**并按预置返回值检查失败报告。没有真实 shell 或用户工作区写权限。候选必须通过所有场景、不能比基线退步，且至少修复一个预先登记的基线失败；`fake` 替身报告为 `insufficient_evidence`。报告包含候选、基线和任务集哈希，任一变化即 `stale`；`missing` / `fail` / `insufficient_evidence` / `stale` 均不能批准。此评测证明的是受控场景行为，不声称真实发布任务端到端通过。
+
 ## 4. 分发：确定性安装
 
 ```text
 approve（用户批准）
-  → 静态门禁 + 同名冲突检查（受管标记）
-  → 提交 Git：candidates/<id>.md 删除，published/<id>.md 写入（status=active）
+  → 静态门禁 + 当前有效的质量报告 + 同名冲突检查（受管标记及所有者 ID）
+  → 提交 Git：candidates/<candidateId>.md 删除，published/<stableId>.md 写入（status=active）
   → 记录 skill_approval 审查留痕
   → 重建投影
   → 安装：写 <skills-dir>/<name>/SKILL.md（带 aquarius 标记与来源 commit）
@@ -106,7 +118,7 @@ approve（用户批准）
 
 安装器规则：
 
-1. 目标目录存在但没有 `aquarius_managed: true` 标记 → **停止**，报 `skill_install_conflict`，绝不覆盖。
+1. 目标目录不存在、或带有相同 `aquarius_skill_id` 的受管标记时才可安装；其他同名目录 → **停止**，报 `skill_install_conflict`。
 2. 安装文件头部写入：`aquarius_managed: true`、`aquarius_skill_id`、`aquarius_commit`，便于后续识别与对账。
 3. Git 是 Skill 内容的 canonical source；安装只是投影，可以随时由 Git 重建。
 4. 安装失败不会把版本报成「可用」：SQLite 里状态保持 `published`，只有文件确实写入并算出哈希才记为 `installed`。
@@ -118,7 +130,7 @@ approve（用户批准）
 
 | 操作 | Git 效果 | 安装效果 | SQLite |
 | --- | --- | --- | --- |
-| `rollback` | 从上一发布 commit 读回内容，写回 `skills/published/<id>.md` | 覆盖受管安装并重算哈希 | 记录新 commit、`rollback_of` 指向被回滚的版本 |
+| `rollback` | 从上一发布 commit 读回内容，以新的 `skill_version` 写回 `skills/published/<id>.md` | 覆盖同 ID 受管安装并重算哈希 | 记录新 commit、`rollback_of` 指向被回滚的版本 |
 | `retire` | 移到 `skills/retired/`，`status=retired`，关闭有效期 | 仅删除带标记的受管目录 | 记录 `retired_at` |
 | `reject` | 移到 `skills/retired/`，`status=rejected` | 无（从未安装）| 无发布记录 |
 
@@ -128,7 +140,7 @@ approve（用户批准）
 
 - 记忆契约版本：`schema_version`（当前 `1`）。写入方只写当前版本；读取方遇到不认识的版本会**报错而不是猜测**。
 - adapter 版本：每个 `SessionSourceAdapter` 有自己的 `schemaVersion`，并记录在 checkpoint 里；格式语义变化时升版本，旧 checkpoint 会被重新处理。
-- Skill 版本：每次发布递增 `version`，历史版本通过 commit 与 SQLite 记录双重可追溯。
+- Skill 版本：每次发布和回滚均递增 `skill_version`，Git frontmatter 是版本事实源；SQLite 发布记录可重建。
 - 升级步骤：改 `schema.ts` → 升版本号 → 写迁移说明（`ARCHITECTURE.md`）→ `CHANGELOG.md` 标 BREAKING → 补测试。
 
 ## 7. 注册流程检查清单
